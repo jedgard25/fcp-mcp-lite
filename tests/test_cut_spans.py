@@ -108,4 +108,13 @@ rpc = FakeRpc([state(40.0, [])])
 assert _fresh_transcript(rpc) == {"words": [], "timeline_duration_s": 40.0}
 print("7 FRESH ok | matching duration accepted")
 
+
+# 8) sentence chunking: punctuation split + word-range mapping
+from server import _sentences
+_w = [{"i": i, "w": w, "t_start": float(i), "t_end": float(i) + 0.5}
+      for i, w in enumerate("Hello world. How are you doing today? Fine".split())]
+_ss = _sentences(_w)
+assert [(s["s"], s["start_word"], s["end_word"]) for s in _ss] == [(0, 0, 1), (1, 2, 6), (2, 7, 7)], _ss
+assert _ss[1]["text"] == "How are you doing today?", _ss[1]["text"]
+print("8 SENTENCES ok |", len(_ss), "chunks")
 print("ALL GREEN")

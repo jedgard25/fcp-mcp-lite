@@ -22,6 +22,7 @@ Time bases (keep them straight):
 import hashlib
 import json
 import os
+import re
 import socket
 import subprocess
 import time
@@ -365,6 +366,35 @@ def _cache_key(media_path: str, engine: str, model: str) -> str:
     return h.hexdigest()[:16]
 
 
+def _sentences(words: list, max_words: int = 40) -> list:
+    """Collapse word rows into sentence chunks for cheap agent reads.
+
+    Each sentence carries its word-index range, so the agent plans on
+    sentences but still cuts on stable word indices (no new verbs needed).
+    ~7x fewer tokens than per-word JSON.
+    """
+    out, cur = [], []
+
+    def flush():
+        if cur:
+            out.append({
+                "s": len(out),
+                "start_word": cur[0]["i"],
+                "end_word": cur[-1]["i"],
+                "t_start": cur[0]["t_start"],
+                "t_end": cur[-1]["t_end"],
+                "text": " ".join(w["w"] for w in cur),
+            })
+            cur.clear()
+
+    for w in words:
+        cur.append(w)
+        if re.search(r"[.?!…]['\"]?$", w.get("w", "")) or len(cur) >= max_words:
+            flush()
+    flush()
+    return out
+
+
 def _load_cache(key: str) -> dict | None:
     os.makedirs(CACHE_DIR, exist_ok=True)
     p = os.path.join(CACHE_DIR, key + ".json")
@@ -427,8 +457,10 @@ def transcribe(engine: str = "parakeet", model: str = "v3") -> dict:
         key = _cache_key(clip["media_path"], engine, model)
         cached = _load_cache(key)
         if cached:
-            return {"cached": True, "clip": clip["name"], **{k: cached[k] for k in ("words", "speakers") if k in cached},
-                    "word_count": len(cached.get("words", []))}
+            sents = cached.get("sentences") or _sentences(cached.get("words", []))
+            return {"cached": True, "clip": clip["name"],
+                    "word_count": len(cached.get("words", [])),
+                    "sentence_count": len(sents), "sentences": sents[:8]}
         words = json.loads(_run([PARAKEET_BIN, clip["media_path"], "--model", model], timeout=1800))
         # file seconds -> timeline seconds
         mapped = []
@@ -440,28 +472,46 @@ def transcribe(engine: str = "parakeet", model: str = "v3") -> dict:
                            "confidence": w.get("confidence"),
                            "speaker": w.get("speaker")})
         data = {"clip": clip["name"], "media_path": clip["media_path"], "words": mapped,
+                "sentences": _sentences(mapped),
                 "timeline_duration_s": _clips(rpc).get("duration_s", 0),
                 "speakers": sorted({w["speaker"] for w in mapped if w.get("speaker")})}
         _save_cache(key, data)
         return {"cached": False, "clip": clip["name"], "word_count": len(mapped),
-                "words": mapped[:50], "note": "first 50 words shown; use get_transcript for full"}
+                "sentence_count": len(data["sentences"]),
+                "sentences": data["sentences"][:8],
+                "note": "first 8 sentences shown; use get_transcript for full (sentences by default)"}
 
     return logged("transcribe", args, run)
 
 
 @mcp.tool()
-def get_transcript(search: str | None = None, limit: int = 200) -> dict:
-    """Read the cached transcript (never spawns an engine). Filter by text."""
-    args = {"search": search, "limit": limit}
+def get_transcript(search: str | None = None, limit: int = 200,
+                   detail: str = "sentences") -> dict:
+    """Read the cached transcript (never spawns an engine).
+
+    detail='sentences' (default): compact sentence chunks with word-index
+    ranges — plan here, then cut with delete_words/move_words using the
+    start_word/end_word range. detail='words': full per-word rows.
+    """
+    args = {"search": search, "limit": limit, "detail": detail}
 
     def run(rpc):
         t = _fresh_transcript(rpc)
         words = t.get("words", [])
+        sentences = t.get("sentences") or _sentences(words)
+        if detail == "words":
+            if search:
+                s = search.lower()
+                words = [w for w in words if s in w.get("w", "").lower()]
+            rows = [{k: v for k, v in w.items() if v is not None}
+                    for w in words[: max(1, limit)]]
+            return {"clip": t.get("clip"), "word_count": len(words), "words": rows}
         if search:
             s = search.lower()
-            words = [w for w in words if s in w.get("w", "").lower()]
+            sentences = [x for x in sentences if s in x["text"].lower()]
         return {"clip": t.get("clip"), "word_count": len(words),
-                "words": words[: max(1, limit)]}
+                "sentence_count": len(sentences),
+                "sentences": sentences[: max(1, limit)]}
 
     return logged("get_transcript", args, run)
 
@@ -470,7 +520,9 @@ def get_transcript(search: str | None = None, limit: int = 200) -> dict:
 def delete_words(start_index: int, count: int, dry_run: bool = True) -> dict:
     """Delete words [start_index, start_index+count) and ripple the video.
 
-    Word timestamps -> one timeline span -> blade/blade/select/delete -> verify.
+    Plan on sentences (get_transcript default): a sentence's start_word /
+    end_word IS the range to pass here. Word timestamps -> one timeline
+    span -> blade/blade/select-by-ID/delete -> verify.
     """
     args = {"start_index": start_index, "count": count, "dry_run": dry_run}
 
