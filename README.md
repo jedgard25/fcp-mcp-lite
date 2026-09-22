@@ -54,7 +54,14 @@ Then point opencode at the MCP server (see `mcp/client-config.json`).
 7. **JSONL or it didn't happen.** `~/.local/share/fcp-mcp-lite/calls.jsonl`
    records every call. `tail -f` it via `make logs`.
 
-Known v0 limits: a batch is N undo entries, not one (`undo_steps` reported);
+Known v0 limits: a batch is N undo entries, not one (`undo_steps` reported —
+pass it to `undo(steps=…)` to revert one call; blades at existing edit
+points are skipped so boundary-aligned cuts cost 1 entry);
 single-user assumed (concurrent hand-editing skews verify counts);
 cut targeting is primary-storyline-first, connected timelines often miss
 (guarded, never wrong).
+Word/silence ops are file-anchored: transcript words store source-file
+times and re-resolve against the live timeline on every call, so chained
+cuts never go stale; `delete_words(ranges=[[start, count], …])` cuts a
+whole retake sweep in one validated batch; silence scans cover every
+on-disk primary clip (one detector run per unique file).

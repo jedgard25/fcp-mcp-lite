@@ -14,6 +14,10 @@ else
   else
     echo "[+] 'mcp' imports cleanly"
   fi
+  REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+  if VER="$("$VENV/bin/python" -c "import sys; sys.path.insert(0, '$REPO_DIR/mcp'); from server import __version__; print(__version__)" 2>/dev/null)"; then
+    echo "[+] mcp server version: $VER (agent sees it via bridge_status)"
+  fi
 fi
 
 if ! python3 -c "import socket; socket.create_connection(('127.0.0.1',$PORT),timeout=3).close()" 2>/dev/null; then

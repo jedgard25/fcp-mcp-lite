@@ -49,8 +49,9 @@ rpc = FakeRpc([state(40.0, [clip("clip_1", 0, 10), clip("clip_2", 10, 20),
 rep = _cut_spans(rpc, [(25.0, 26.0)], "t")
 selects = [c for c in rpc.calls if c[0] == "timeline.select"]
 assert rep["verify"] == "ok" and rep["removed"] == 1, rep
+assert rep["undo_steps"] == 3, rep  # 2 blades (mid-timeline) + 1 delete
 assert selects and selects[0][1] == {"id": "clip_2b"}, selects
-print("1 HIT ok | selected by ID:", selects[0][1])
+print("1 HIT ok | selected by ID:", selects[0][1], "| undo_steps:", rep["undo_steps"])
 
 # 2) MISS: blades landed (1 -> 3 clips) but no segment covers mid ->
 #     both blades reverted, BridgeError
@@ -65,7 +66,7 @@ except BridgeError as e:
     assert len(rpc.undos()) == 2, rpc.calls
     print("2 MISS ok | undos:", len(rpc.undos()))
 
-# 3) select fails identity check -> blades reverted, nothing deleted
+# 3) select fails identity check -> issued blades reverted, nothing deleted
 rpc = FakeRpc([state(40.0, [clip("clip_1", 0, 10), clip("clip_2", 10, 20)]),
                state(40.0, [clip("clip_1", 0, 10), clip("clip_2", 10, 20)]),
                seg_state()], fail_select=True)
@@ -73,7 +74,7 @@ try:
     _cut_spans(rpc, [(25.0, 26.0)], "t")
     raise SystemExit("3 SELECT-FAIL: NO ERROR (bad)")
 except BridgeError as e:
-    assert len(rpc.undos()) == 4, rpc.calls  # 6 fresh - 2 pre-blade
+    assert len(rpc.undos()) == 2, rpc.calls  # the 2 blades issued, nothing else
     assert not [c for c in rpc.calls if c == ("timeline.action", {"action": "delete"})]
     print("3 SELECT-FAIL ok | no delete issued, undos:", len(rpc.undos()))
 
@@ -83,6 +84,7 @@ rpc = FakeRpc([state(40.0, [clip("clip_1", 0, 10), clip("clip_2", 10, 20)]),
                seg_state(), seg_state()])
 rep = _cut_spans(rpc, [(25.0, 26.0)], "t")
 assert rep["verify"].startswith("MISMATCH"), rep
+assert "undo(steps=3)" in rep["verify"], rep
 print("4 MISMATCH ok |", rep["verify"][:70])
 
 # 5) stale ID resolution
@@ -94,20 +96,32 @@ except BridgeError as e:
     assert "stale id" in str(e), e
     print("5 STALE ok |", str(e)[:60])
 
-# 6) transcript freshness: rippled timeline refuses word cuts
+# 6) transcript cache is content-stable: rippled timelines stay usable
+#    (file times re-resolve live; no duration guard to dead-end chained cuts)
 import server as S
-S._last_transcript = lambda: {"words": [], "timeline_duration_s": 40.0}
-rpc = FakeRpc([state(39.0, [])])
-try:
-    _fresh_transcript(rpc)
-    raise SystemExit("6 FRESH: NO ERROR (bad)")
-except BridgeError as e:
-    assert "re-run transcribe" in str(e), e
-    print("6 FRESH ok | stale cache refused")
-rpc = FakeRpc([state(40.0, [])])
-assert _fresh_transcript(rpc) == {"words": [], "timeline_duration_s": 40.0}
-print("7 FRESH ok | matching duration accepted")
+S._last_transcript = lambda: {"words": [], "timeline_duration_s": 40.0,
+                              "media_path": "/tmp/x.mp4"}
+assert _fresh_transcript(FakeRpc([state(39.0, [])]))["timeline_duration_s"] == 40.0
+print("6 FRESH ok | rippled timeline accepted (live re-resolve)")
 
+
+# 7) boundary-aware blades: span exactly on edit points issues no blades
+def mclip(cid, t0, dur, trim=None, media="/tmp/x.mp4"):
+    d = clip(cid, t0, dur)
+    d["media_path"] = media
+    d["trim_start_s"] = trim if trim is not None else t0
+    return d
+
+
+rpc = FakeRpc([state(30.0, [mclip("c1", 0, 10), mclip("c2", 10, 10), mclip("c3", 20, 10)]),
+               state(30.0, [mclip("c1", 0, 10), mclip("c2", 10, 10), mclip("c3", 20, 10)]),
+               state(30.0, [mclip("c1", 0, 10), mclip("c2", 10, 10), mclip("c3", 20, 10)]),
+               state(20.0, [mclip("c1", 0, 10), mclip("c3", 10, 10, trim=20)])])
+rep = _cut_spans(rpc, [(10.0, 20.0)], "t")
+blades = [c for c in rpc.calls if c == ("timeline.action", {"action": "blade"})]
+assert not blades and rep["undo_steps"] == 1, (rep, blades)
+assert rep["verify"] == "ok", rep
+print("7 BOUNDARY ok | no blades, undo_steps:", rep["undo_steps"])
 
 # 8) sentence chunking: punctuation split + word-range mapping
 from server import _sentences
@@ -117,4 +131,42 @@ _ss = _sentences(_w)
 assert [(s["s"], s["start_word"], s["end_word"]) for s in _ss] == [(0, 0, 1), (1, 2, 6), (2, 7, 7)], _ss
 assert _ss[1]["text"] == "How are you doing today?", _ss[1]["text"]
 print("8 SENTENCES ok |", len(_ss), "chunks")
+
+# 9) file->timeline resolve survives a cut (Bug 1 chaining):
+#    one 30s source split [0,10]+[10,10]+[20,10]; word at file 21.0 is at
+#    timeline 21.0. After cutting file [10,20) away the layout compacts to
+#    [0,10]+[10,10](trim 20) and the same word re-resolves to timeline 11.0.
+from server import _resolve_file_interval, _words_with_live_times, _merge_spans
+_before = [mclip("c1", 0, 10, trim=0), mclip("c2", 10, 10, trim=10), mclip("c3", 20, 10, trim=20)]
+_after = [mclip("c1", 0, 10, trim=0), mclip("c3", 10, 10, trim=20)]
+assert _resolve_file_interval(_before, "/tmp/x.mp4", 21.0, 22.0) == [(21.0, 22.0)]
+assert _resolve_file_interval(_after, "/tmp/x.mp4", 21.0, 22.0) == [(11.0, 12.0)]
+assert _resolve_file_interval(_after, "/tmp/x.mp4", 12.0, 14.0) == [], "cut-away file time must map to nothing"
+print("9 RESOLVE ok | file times track the compacted layout")
+
+# 10) batch word ranges resolve to merged spans; removed words skip, not fail
+import os as _os
+_REAL_MEDIA = _os.path.abspath(__file__)  # on-disk stand-in for existence checks
+S._last_transcript = lambda: {
+    "clip": "c", "media_path": _REAL_MEDIA,
+    "words": [{"i": 0, "w": "hello", "f_start": 1.0, "f_end": 1.5},
+              {"i": 1, "w": "world", "f_start": 12.0, "f_end": 12.5},   # cut away
+              {"i": 2, "w": "again", "f_start": 21.0, "f_end": 21.5}],
+    "timeline_duration_s": 30.0}
+from server import _word_ranges_to_spans
+_after_real = [dict(c, media_path=_REAL_MEDIA) for c in _after]
+rpc = FakeRpc([state(20.0, _after_real)])
+spans, texts, skipped = _word_ranges_to_spans(rpc, [(0, 1), (1, 1), (2, 1)])
+assert spans == [(1.0, 1.5), (11.0, 11.5)], spans
+assert skipped and skipped[0]["start_index"] == 1, skipped
+print("10 BATCH ok | spans:", spans, "| skipped:", len(skipped))
+
+# 11) silence mapping spans clips + merges across the split
+spans = _merge_spans([(1.0, 2.0), (2.01, 3.0), (9.0, 9.5)])
+assert spans == [(1.0, 3.0), (9.0, 9.5)], spans
+from server import _silence_warning
+w = _silence_warning([(0, 100.0)], duration_s=400.0)
+assert w["warning"] and w["fraction"] == 0.25, w
+assert _silence_warning([(0, 10.0)], duration_s=400.0)["warning"] is None
+print("11 SILENCE ok | merge + aggressive-warning")
 print("ALL GREEN")
