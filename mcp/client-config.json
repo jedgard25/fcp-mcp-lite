@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "fcp-mcp-lite": {
+      "command": "/Users/evindrews/.venvs/fcp-mcp-lite/bin/python",
+      "args": ["/Users/evindrews/Projects/fcp-mcp-lite/mcp/server.py"]
+    }
+  }
+}

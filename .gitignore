@@ -1,0 +1,7 @@
+# build artifacts (rebuild with make / swift build)
+bridge/build/
+tools/parakeet-transcriber/.build/
+__pycache__/
+*.pyc
+.DS_Store
+# local runtime state (logs, transcript caches) lives outside the repo
