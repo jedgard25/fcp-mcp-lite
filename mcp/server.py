@@ -19,6 +19,7 @@ Time bases (keep them straight):
   - file_s -> timeline_s: clip.timeline_start_s + (file_s - clip.trim_start_s)
 """
 
+import difflib
 import hashlib
 import json
 import os
@@ -40,7 +41,7 @@ REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # is talking to the latest checkout. (The injected dylib carries its own
 # FCB_VERSION in bridge/FCPBridge.m — the two versions are independent
 # and reported side-by-side.)
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 # Transcript-cache schema. Bumped on any words/cache layout change; the key
 # AND the payload both carry it, so an upgrade never dead-ends on a stale
 # cache hit ("safe to reuse but not when our schema changes").
@@ -427,7 +428,10 @@ def _cut_spans(rpc, spans: list, label: str, max_spans: int | None = None) -> di
     after = _clips(rpc)
     dur_after = after.get("duration_s", 0)
     expected = dur_before - removed_s
-    ok = abs(dur_after - expected) < 0.15  # within ~4 frames @24fps
+    # Frame-snap scales with span count: each blade lands on a frame
+    # boundary, so a fixed 4-frame window false-MISMATCHes on big sweeps.
+    tol = 0.15 + 0.05 * steps
+    ok = abs(dur_after - expected) < tol
     report = {
         "removed": steps,
         "removed_s": round(removed_s, 3),
@@ -823,6 +827,241 @@ def _sentences(words: list, max_words: int = 40) -> list:
     return out
 
 
+# ---------------------------------------------------------------- story
+# Text-first editing: stable fragment IDs over FILE words, keep-list plans.
+#
+# The model never does range math. It reads compact lines (id + text),
+# declares the desired shape (keep these ids in this order), and the
+# server resolves ids -> file intervals -> live timeline spans at commit.
+# Fragment ids (L{start_word:04d}) derive from immutable file word indices,
+# so unlike positional sentence numbers they never shift after a cut.
+
+CRUMB_WARN_S = 0.25  # kept fragments shorter than this are flagged, never silently absorbed
+
+
+def _story_fragments(cache_words: list, max_words: int = 40) -> list:
+    """Chunk FILE-ordered words with the same policy as _sentences.
+
+    Ids are file-anchored (L{first_word_index:04d}) — stable across edits.
+    """
+    out, cur = [], []
+
+    def flush():
+        if cur:
+            out.append({
+                "id": f"L{cur[0]['i']:04d}",
+                "start_word": cur[0]["i"],
+                "end_word": cur[-1]["i"],
+                "text": " ".join(w["w"] for w in cur),
+                "f_start": float(cur[0]["f_start"]),
+                "f_end": float(cur[-1]["f_end"]),
+            })
+            cur.clear()
+
+    for w in cache_words:
+        cur.append(w)
+        if re.search(r"[.?!…]['\"]?$", w.get("w", "")) or len(cur) >= max_words:
+            flush()
+    flush()
+    return out
+
+
+def _norm_text(t: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", t.lower())).strip()
+
+
+def _take_groups(frags: list, window: int = 10, ratio: float = 0.6) -> list:
+    """Group near-duplicate fragments (retakes) within a sliding window.
+
+    Union-find over normalized SequenceMatcher ratio. Group id derives
+    from the smallest member id, so it is stable across reads.
+    """
+    n = len(frags)
+    parent = list(range(n))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    norms = [_norm_text(f["text"]) for f in frags]
+    for i in range(n):
+        if len(norms[i]) < 12:
+            continue  # too short to fuzzy-match meaningfully
+        for j in range(i + 1, min(n, i + 1 + window)):
+            if len(norms[j]) < 12:
+                continue
+            if difflib.SequenceMatcher(None, norms[i], norms[j]).ratio() >= ratio:
+                union(i, j)
+    buckets: dict = {}
+    for i in range(n):
+        buckets.setdefault(find(i), []).append(i)
+    groups = []
+    for members in buckets.values():
+        if len(members) >= 2:
+            ids = [frags[k]["id"] for k in members]
+            groups.append({"group": f"G{min(ids)}", "members": ids,
+                           "texts": [frags[k]["text"] for k in members]})
+    return sorted(groups, key=lambda g: g["group"])
+
+
+def _story_live(rpc, t: dict) -> tuple:
+    """Stable fragments with live timeline positions attached.
+
+    Returns (frags, missing). frags are in FILE order; each carries
+    t_start/t_end (outer span) or removed=True when fully cut away.
+    """
+    cache_words = t.get("words", [])
+    if cache_words and "f_start" not in cache_words[0]:
+        raise BridgeError("transcript predates file-relative times — re-run transcribe once")
+    media = t.get("media_path")
+    if media is None:
+        raise BridgeError("transcript has no media_path — re-run transcribe")
+    clips = _all_existing_clips(rpc)
+    frags = _story_fragments(cache_words)
+    missing = 0
+    for f in frags:
+        hits = _resolve_file_interval(clips, media, f["f_start"], f["f_end"])
+        if not hits:
+            missing += 1
+            f["t_start"], f["t_end"], f["removed"] = -1, -1, True
+        else:
+            f["t_start"], f["t_end"] = hits[0][0], hits[-1][1]
+    for g in _take_groups([f for f in frags if not f.get("removed")]):
+        for mid in g["members"]:
+            for f in frags:
+                if f["id"] == mid:
+                    f["take_group"] = g["group"]
+    return frags, missing
+
+
+def _expand_to_midpoints(frag, by_index: dict, cache_words: list) -> tuple:
+    """Expand a drop fragment's file interval to inter-word midpoints.
+
+    Blades then land in silence between words instead of mid-phoneme —
+    the fix for orphan micro-word crumbs after frame-snap.
+    """
+    pos = {w["i"]: k for k, w in enumerate(cache_words)}
+    first, last = cache_words[pos[frag["start_word"]]], cache_words[pos[frag["end_word"]]]
+    fa, fb = float(first["f_start"]), float(last["f_end"])
+    lo, hi = pos[frag["start_word"]], pos[frag["end_word"]]
+    if lo > 0:
+        prev = cache_words[lo - 1]
+        if "f_end" in prev:
+            fa = (float(prev["f_end"]) + fa) / 2
+    if hi + 1 < len(cache_words):
+        nxt = cache_words[hi + 1]
+        if "f_start" in nxt:
+            fb = (fb + float(nxt["f_start"])) / 2
+    _ = by_index  # reserved for future cross-file maps
+    return (round(fa, 3), round(fb, 3))
+
+
+def _story_plan(rpc, keep_ids: list) -> dict:
+    """Validate a keep-list and resolve it to drops + moves (no writes).
+
+    Returns error dict or plan dict with text-first fields the model can
+    verify by eye: will_remove (id+text), moves (id after anchor), plus
+    machine fields (spans, would_remove_s) for the executor.
+    """
+    t = _fresh_transcript(rpc)
+    cache_words = t.get("words", [])
+    media = t.get("media_path")
+    frags, _ = _story_live(rpc, t)
+    known = {f["id"] for f in frags}
+    if not keep_ids:
+        return {"ok": False, "error": "keep must be a non-empty list of fragment ids"}
+    if len(set(keep_ids)) != len(keep_ids):
+        dupes = sorted({k for k in keep_ids if keep_ids.count(k) > 1})
+        return {"ok": False, "error": f"duplicate ids in keep: {dupe_str(dupes)}"}
+    unknown = [k for k in keep_ids if k not in known]
+    if unknown:
+        return {"ok": False, "error": f"unknown fragment ids (re-read get_story): {unknown[:8]}"}
+    by_id = {f["id"]: f for f in frags}
+    gone = [k for k in keep_ids if by_id[k].get("removed")]
+    if gone:
+        return {"ok": False, "error": f"already-removed ids in keep (re-read get_story): {gone[:8]}"}
+    keep_set = set(keep_ids)
+    live_order = [f["id"] for f in sorted(
+        (f for f in frags if not f.get("removed")), key=lambda f: f["t_start"])]
+    drop_frags = [by_id[i] for i in live_order if i not in keep_set]
+    # Drops resolve via midpoint-expanded file intervals (crumb fix).
+    by_index = {}
+    spans: list = []
+    if media in _trim_health(_all_existing_clips(rpc)):
+        return {"ok": False, "error": "trim layout degenerate — word cuts blocked until the bridge is fixed"}
+    clips = _all_existing_clips(rpc)
+    for f in drop_frags:
+        fa, fb = _expand_to_midpoints(f, by_index, cache_words)
+        for a, b in _resolve_file_interval(clips, media, fa, fb, strict=True):
+            spans.append((a, b))
+    spans = _merge_spans(spans)
+    spans = [(a, b) for a, b in spans if b - a >= SILENCE_FRAME]
+    # Moves: minimal plan — longest already-ordered subsequence stays.
+    cur_pos = {fid: k for k, fid in enumerate(live_order) if fid in keep_set}
+    want = [fid for fid in keep_ids]
+    # LIS over current positions in desired order.
+    import bisect as _bisect
+    tails: list = []
+    for fid in want:
+        p = cur_pos[fid]
+        k = _bisect.bisect_left(tails, p)
+        if k == len(tails):
+            tails.append(p)
+        else:
+            tails[k] = p
+    need_move = len(want) - len(tails)
+    moves: list = []
+    if need_move:
+        placed = set()
+        # Simulate left-to-right placement; anything out of place moves after its predecessor.
+        cur = [fid for fid in live_order if fid in keep_set]
+        for k, fid in enumerate(want):
+            if k < len(cur) and cur[k] == fid:
+                placed.add(fid)
+                continue
+            anchor = want[k - 1] if k else None
+            moves.append({"id": fid, "after": anchor} if anchor else {"id": fid, "before": want[1] if len(want) > 1 else None})
+            c = [x for x in cur if x != fid]
+            ins = (c.index(anchor) + 1) if anchor and anchor in c else 0
+            c.insert(ins, fid)
+            cur = c
+    crumbs = [{"id": f["id"], "text": f["text"],
+               "dur_s": round(f["t_end"] - f["t_start"], 3)}
+              for f in frags if f["id"] in keep_set
+              and not f.get("removed") and (f["t_end"] - f["t_start"]) < CRUMB_WARN_S]
+    dur = _clips(rpc).get("duration_s", 0)
+    remove_s = round(sum(b - a for a, b in spans), 3)
+    return {"ok": True, "keep": keep_ids, "kept": len(keep_ids),
+            "will_remove": [{"id": f["id"], "text": f["text"]} for f in drop_frags],
+            "drops": len(drop_frags), "spans": spans,
+            "would_remove_s": remove_s,
+            "duration_before_s": round(dur, 3),
+            "duration_after_s": round(dur - remove_s, 3),
+            "moves": moves, "crumbs": crumbs}
+
+
+def dupe_str(dupes: list) -> str:
+    return ", ".join(dupes[:8])
+
+
+def _move_live_span(rpc, span: tuple, dest_t: float) -> float:
+    """Cut one live span and paste at dest_t (anchor re-resolved by caller)."""
+    span_len = span[1] - span[0]
+    _isolate_span(rpc, span[0], span[1])
+    rpc("timeline.action", {"action": "cut"})
+    dest_adj = dest_t - span_len if dest_t > span[1] else dest_t
+    rpc("playback.seek", {"t_s": max(0, dest_adj)})
+    rpc("timeline.action", {"action": "paste"})
+    return dest_adj
+
+
 def _load_cache(key: str) -> dict | None:
     os.makedirs(CACHE_DIR, exist_ok=True)
     p = os.path.join(CACHE_DIR, key + ".json")
@@ -1112,6 +1351,171 @@ def move_words(start_index: int, count: int, dest_index: int, dry_run: bool = Tr
                 "verify": "ok" if ok else f"MISMATCH duration {dur0:.3f}s -> {dur1:.3f}s — undo(steps=2) to revert"}
 
     return logged("move_words", args, run)
+
+
+# ---------------------------------------------------------------- story tools
+
+
+@mcp.tool()
+def get_story(search: str | None = None, limit: int = 200, offset: int = 0,
+              detail: str = "compact", include_removed: bool = False) -> dict:
+    """Read the transcript as stable story lines (the model's editing UI).
+
+    detail='compact' (default): id + text only (~10 tok/line — no times,
+    no word indices). detail='full': adds word ranges, file/live times,
+    take_group, removed flags. Ids (L0020) are file-anchored and never
+    shift after cuts — plan with these, commit with apply_story.
+    Never spawns an engine.
+    """
+    args = {"search": search, "limit": limit, "offset": offset,
+            "detail": detail, "include_removed": include_removed}
+
+    def run(rpc):
+        t = _fresh_transcript(rpc)
+        frags, missing = _story_live(rpc, t)
+        groups = _take_groups([f for f in frags if not f.get("removed")])
+        rows = frags if include_removed else [f for f in frags if not f.get("removed")]
+        if search:
+            s = search.lower()
+            rows = [f for f in rows if s in f["text"].lower()]
+        total = len(rows)
+        rows = rows[max(0, offset): max(0, offset) + max(1, limit)]
+        if detail == "full":
+            lines = [{k: v for k, v in f.items() if v is not None} for f in rows]
+        else:
+            lines = [{"id": f["id"], "text": f["text"],
+                      **({"take_group": f["take_group"]} if f.get("take_group") else {})}
+                     for f in rows]
+        out: dict = {"clip": t.get("clip"), "line_count": total,
+                     "lines": lines, "removed_lines": missing,
+                     "take_groups": groups}
+        try:
+            bad = _trim_health(_all_existing_clips(rpc))
+        except BridgeError:
+            bad = []
+        if bad:
+            out["trim_degenerate"] = bad
+            out["trim_note"] = ("bridge trim unknown — story positions best-effort, "
+                                "cuts blocked until fixed")
+        return out
+
+    return logged("get_story", args, run)
+
+
+@mcp.tool()
+def apply_story(keep: list, dry_run: bool = True,
+                max_spans: int | None = None) -> dict:
+    """Rough cut + reorder in one verb: declare what stays and in what order.
+
+    keep=[ids in desired order] (see get_story). Drops resolve at commit
+    via midpoint-expanded file intervals (blades land in silence — no
+    orphan crumbs); cuts run right-to-left; reorders run as minimal
+    anchor moves after the drops. dry_run=True (default) returns
+    will_remove as TEXT plus moves — verify by eye, no seconds math.
+    For large drops pass max_spans=N: cuts the rightmost N drop spans,
+    returns `pending` — finish with cut_spans(pending) until remaining=0.
+    """
+    args = {"keep": keep, "dry_run": dry_run, "max_spans": max_spans}
+
+    def run(rpc):
+        plan = _story_plan(rpc, list(keep or []))
+        if not plan.get("ok"):
+            return plan
+        if dry_run or (not plan["spans"] and not plan["moves"]):
+            plan["dry_run"] = True
+            return plan
+        undos = 0
+        report: dict = {}
+        if plan["spans"]:
+            try:
+                cut = _cut_spans(rpc, plan["spans"], "apply_story", max_spans)
+            except BridgeError as e:
+                return {"ok": False, "error": str(e)}
+            undos += cut.get("undo_steps", 0)
+            report.update(cut)
+            if cut.get("remaining"):
+                # Drops chunked: moves wait until drops finish (anchors shift).
+                report["moves_pending"] = plan["moves"]
+                report["will_remove"] = plan["will_remove"]
+                report["note"] = ("chunked: finish drops with cut_spans(pending) "
+                                  "until remaining is 0, then re-call apply_story "
+                                  "with the same keep for moves")
+                return report
+        moves_done = []
+        dur0 = _clips(rpc).get("duration_s", 0)
+        for m in plan["moves"]:
+            live, _ = _story_live(rpc, _fresh_transcript(rpc))
+            by_id = {f["id"]: f for f in live if not f.get("removed")}
+            src = by_id.get(m["id"])
+            anchor_id = m.get("after") or m.get("before")
+            anchor = by_id.get(anchor_id) if anchor_id else None
+            if src is None or (anchor_id and anchor is None):
+                moves_done.append({**m, "error": "anchor/src cut away mid-batch — re-plan"})
+                continue
+            span = (src["t_start"], src["t_end"])
+            if m.get("after"):
+                dest_t = anchor["t_end"]
+            elif m.get("before"):
+                dest_t = anchor["t_start"]
+            else:
+                dest_t = 0.0
+            if span[0] <= dest_t <= span[1]:
+                continue  # already in place after prior moves
+            _move_live_span(rpc, span, dest_t)
+            undos += 2  # cut + paste
+            moves_done.append({**m, "done": True})
+        after = _clips(rpc)
+        dur1 = after.get("duration_s", 0)
+        tol = 0.15 + 0.05 * max(1, len(moves_done))
+        ok = abs(dur1 - dur0) < tol  # moves preserve duration
+        report["moves"] = moves_done
+        report["will_remove"] = plan["will_remove"]
+        report["crumbs"] = plan["crumbs"]
+        report["undo_steps"] = undos + report.get("undo_steps", 0)
+        report["moved_verify"] = ("ok" if ok else
+                                  f"MISMATCH duration {dur0:.3f}s -> {dur1:.3f}s — undo(steps={report['undo_steps']}) to revert")
+        return report
+
+    return logged("apply_story", args, run)
+
+
+@mcp.tool()
+def choose_take(group: str, keep: str, dry_run: bool = True) -> dict:
+    """Keep one member of a retake group, drop the rest (see get_story).
+
+    dry_run returns the dropped takes as TEXT. Executes through the same
+    midpoint-expanded drop path as apply_story (order preserved).
+    """
+    args = {"group": group, "keep": keep, "dry_run": dry_run}
+
+    def run(rpc):
+        t = _fresh_transcript(rpc)
+        frags, _ = _story_live(rpc, t)
+        groups = _take_groups([f for f in frags if not f.get("removed")])
+        g = next((x for x in groups if x["group"] == group), None)
+        if g is None:
+            return {"ok": False, "error": f"unknown take group {group} (re-read get_story)"}
+        if keep not in g["members"]:
+            return {"ok": False, "error": f"{keep} not in {group}{g['members']}"}
+        present = [f["id"] for f in sorted(
+            (f for f in frags if not f.get("removed")), key=lambda f: f["t_start"])]
+        keep_ids = [fid for fid in present if fid not in set(g["members"]) or fid == keep]
+        plan = _story_plan(rpc, keep_ids)
+        if not plan.get("ok"):
+            return plan
+        plan["group"], plan["kept_take"] = group, keep
+        if dry_run or not plan["spans"]:
+            plan["dry_run"] = True
+            return plan
+        try:
+            cut = _cut_spans(rpc, plan["spans"], "choose_take")
+        except BridgeError as e:
+            return {"ok": False, "error": str(e)}
+        cut["group"], cut["kept_take"] = group, keep
+        cut["will_remove"] = plan["will_remove"]
+        return cut
+
+    return logged("choose_take", args, run)
 
 
 # ---------------------------------------------------------------- identity ops
