@@ -21,7 +21,7 @@
 #import <unistd.h>
 
 #define FCB_PORT 9876
-#define FCB_VERSION @"0.1.0"
+#define FCB_VERSION @"0.2.0"
 
 // Matches CMTime layout {value:int64, timescale:int32, flags:uint32, epoch:int64}.
 typedef struct { int64_t value; int32_t timescale; uint32_t flags; int64_t epoch; } FCB_CMTime;
@@ -180,6 +180,21 @@ static NSMutableArray<NSValue *> *FCB_livePointers(id sequence) {
             NSString *cls = NSStringFromClass([item class]) ?: @"";
             BOOL isMedia = [cls containsString:@"MediaComponent"] || [cls containsString:@"AnchoredClip"];
             BOOL isGap = [cls containsString:@"Gap"];
+            if (isMedia && !isGap) {
+                // Nested items anchored to a media clip (see FCB_appendClip).
+                @try {
+                    SEL aiSel = NSSelectorFromString(@"anchoredItems");
+                    if ([item respondsToSelector:aiSel]) {
+                        id nraw = ((id (*)(id, SEL))objc_msgSend)(item, aiSel);
+                        NSArray *subs = nil;
+                        if ([nraw isKindOfClass:[NSSet class]]) subs = [(NSSet *)nraw allObjects];
+                        else if ([nraw isKindOfClass:[NSArray class]]) subs = nraw;
+                        for (id sub in subs ?: @[])
+                            [ptrs addObject:[NSValue valueWithPointer:(const void *)sub]];
+                    }
+                } @catch (NSException *e) {}
+                continue;
+            }
             if (!isMedia && !isGap) {
                 id inner = nil;
                 if ([item respondsToSelector:@selector(containedItems)]) {
@@ -199,6 +214,114 @@ static NSDictionary *FCB_systemVersion(void) {
     NSString *fcp = [[[NSBundle mainBundle] infoDictionary]
         objectForKey:@"CFBundleShortVersionString"];
     return @{@"fcp": fcp ?: @"?", @"bridge": FCB_VERSION};
+}
+
+// Source-space range candidates for the trim (file offset) probe. Deliberately
+// source-only: timeline-space ranges (effectiveRangeOfObject:/anchoredOffset)
+// would alias timeline_start as trim and must never enter this list.
+static NSArray<NSString *> *FCB_trimRangeSelectors(void) {
+    return @[@"unclippedRange", @"sourceRange", @"mediaRange", @"trimmedRange",
+             @"sourceTimeRange", @"untrimmedRange", @"originalRange", @"availableRange"];
+}
+
+// Probe every trim candidate on a clip. Returns start->seconds for each sane
+// hit (duration matches the clip within half a second — filters out full-media
+// ranges). The caller picks the consensus; disagreement means "unknown".
+static NSMutableDictionary *FCB_trimCandidatesForClip(id item, double clipDur) {
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    for (NSString *name in FCB_trimRangeSelectors()) {
+        SEL s = NSSelectorFromString(name);
+        if (![item respondsToSelector:s]) continue;
+        FCB_CMTimeRange u = {{0,0,0,0},{0,0,0,0}};
+        if (!FCB_structCall(item, s, nil, &u)) continue;
+        double d = FCB_seconds(u.duration);
+        if (d <= 0) continue;
+        if (clipDur > 0) {
+            double dd = d - clipDur;
+            if (dd < 0) dd = -dd;
+            if (dd > 0.5) continue;
+        }
+        double st = FCB_seconds(u.start);
+        if (st < 0) continue;
+        out[name] = @(st);
+    }
+    return out;
+}
+
+static double FCB_trimStartForClip(id item, double clipDur, double clipStart, NSDictionary **candsOut) {
+    NSMutableDictionary *cands = FCB_trimCandidatesForClip(item, clipDur);
+    // The per-clip source in-point lives one hop away: a member of
+    // anchoredTimelineItems carries sourceAnchorTime/localAnchorTime
+    // (verified: 0 for the first clip, 8.51 for clip_2, 1809.14 for a late
+    // clip — each with trim+dur inside the full media length).
+    // detachAudio exposes the same values but its name promises mutation —
+    // never call it in production. The hop array's order varies, so scan
+    // members for the geometric match (timelineRange == this clip) and
+    // accept only if trim + clipDur fits inside the full media length.
+    @try {
+        SEL aiSel = NSSelectorFromString(@"anchoredTimelineItems");
+        if ([item respondsToSelector:aiSel]) {
+            id arr = ((id (*)(id, SEL))objc_msgSend)(item, aiSel);
+            NSArray *list = nil;
+            if ([arr isKindOfClass:[NSArray class]]) list = arr;
+            else if ([arr isKindOfClass:[NSSet class]]) list = [(NSSet *)arr allObjects];
+            double fullDur = 0;
+            FCB_CMTimeRange u = {{0,0,0,0},{0,0,0,0}};
+            if (FCB_structCall(item, NSSelectorFromString(@"unclippedRange"), nil, &u))
+                fullDur = FCB_seconds(u.duration);
+            for (id hop in list ?: @[]) {
+                FCB_CMTimeRange tr = {{0,0,0,0},{0,0,0,0}};
+                if (!FCB_structCall(hop, NSSelectorFromString(@"timelineRange"), nil, &tr))
+                    continue;
+                double dd = FCB_seconds(tr.duration) - clipDur;
+                if (dd < 0) dd = -dd;
+                if (dd > 0.5) continue;
+                double ds = FCB_seconds(tr.start) - clipStart;
+                if (ds < 0) ds = -ds;
+                if (ds > 0.05) continue;
+                for (NSString *nm in @[@"sourceAnchorTime", @"localAnchorTime"]) {
+                    SEL ts = NSSelectorFromString(nm);
+                    if (![hop respondsToSelector:ts]) continue;
+                    FCB_CMTime t = {0,0,0,0};
+                    if (!FCB_structCall(hop, ts, nil, &t) || t.timescale <= 0) continue;
+                    double v = FCB_seconds(t);
+                    if (v < 0) continue;
+                    if (fullDur > 0 && v + clipDur > fullDur + 0.5) continue;
+                    cands[@"anchoredTimelineItems.sourceAnchorTime"] = @(v);
+                    break;
+                }
+                if (cands[@"anchoredTimelineItems.sourceAnchorTime"]) break;
+            }
+        }
+    } @catch (NSException *e) {}
+    // Primary trim path: parentToLocalOffset maps parent (spine) time to
+    // local (source) time, i.e. trim = timeline_start + offset (verified:
+    // 0 for the first clip, 2.0 for clip_2, 242.31 for a late clip —
+    // each consistent with the logged cut history). Same full-length
+    // bound as above; rejected values leave the clip degenerate (blocked,
+    // never wrong-cut). Python re-validates the whole tiling.
+    @try {
+        SEL poSel = NSSelectorFromString(@"parentToLocalOffset");
+        if ([item respondsToSelector:poSel]) {
+            FCB_CMTime off = {0,0,0,0};
+            if (FCB_structCall(item, poSel, nil, &off) && off.timescale > 0) {
+                double v = clipStart + FCB_seconds(off);
+                if (v >= 0) {
+                    double fullDur = 0;
+                    FCB_CMTimeRange u = {{0,0,0,0},{0,0,0,0}};
+                    if (FCB_structCall(item, NSSelectorFromString(@"unclippedRange"), nil, &u))
+                        fullDur = FCB_seconds(u.duration);
+                    if (fullDur <= 0 || v + clipDur <= fullDur + 0.5)
+                        cands[@"parentToLocalOffset-derived"] = @(v);
+                }
+            }
+        }
+    } @catch (NSException *e) {}
+    if (candsOut) *candsOut = cands;
+    double best = 0;
+    for (NSNumber *n in [cands allValues])
+        if ([n doubleValue] > best) best = [n doubleValue];
+    return best;
 }
 
 static void FCB_appendClip(NSMutableArray *out, id item, id primaryObj,
@@ -264,9 +387,9 @@ static void FCB_appendClip(NSMutableArray *out, id item, id primaryObj,
         start = FCB_timeOf(item, NSSelectorFromString(@"anchoredOffset"));
     if (start < 0) start = 0;
     double trim = 0;
-    FCB_CMTimeRange u = {{0,0,0,0},{0,0,0,0}};
-    if (FCB_structCall(item, NSSelectorFromString(@"unclippedRange"), nil, &u))
-        trim = FCB_seconds(u.start);
+    NSDictionary *cands = nil;
+    @try { trim = FCB_trimStartForClip(item, dur, start, &cands); }
+    @catch (NSException *e) { trim = 0; cands = nil; }
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
     d[@"index"] = @((*idx)++);
     NSString *cid = FCB_idForObject(item);
@@ -280,10 +403,46 @@ static void FCB_appendClip(NSMutableArray *out, id item, id primaryObj,
     d[@"timeline_start_s"] = @(start);
     d[@"duration_s"] = @(dur);
     d[@"trim_start_s"] = @(trim);
+    if (cands && [cands count] > 0) d[@"trim_candidates"] = cands;
     if (selected) d[@"selected"] = @([selected containsObject:item]);
     NSString *path = isMedia ? FCB_mediaPathForClip(item) : nil;
     if (path) d[@"media_path"] = path;
     [out addObject:d];
+    // Nested items anchored directly to a media clip (connected audio,
+    // titles, markers-as-items). One level only. These are addressable
+    // (registered IDs) so a stray can be selected + deleted like any clip.
+    @try {
+        SEL aiSel = NSSelectorFromString(@"anchoredItems");
+        if ([item respondsToSelector:aiSel]) {
+            id raw = ((id (*)(id, SEL))objc_msgSend)(item, aiSel);
+            NSArray *subs = nil;
+            if ([raw isKindOfClass:[NSSet class]]) subs = [(NSSet *)raw allObjects];
+            else if ([raw isKindOfClass:[NSArray class]]) subs = raw;
+            for (id sub in subs ?: @[]) {
+                if (sub == item) continue;
+                double sdur = FCB_timeOf(sub, @selector(duration));
+                if (sdur <= 0) continue;
+                double sstart = start;
+                if (primaryObj) {
+                    FCB_CMTimeRange sr = {{0,0,0,0},{0,0,0,0}};
+                    if (FCB_structCall(primaryObj, NSSelectorFromString(@"effectiveRangeOfObject:"), sub, &sr))
+                        sstart = FCB_seconds(sr.start);
+                }
+                NSMutableDictionary *nd = [NSMutableDictionary dictionary];
+                nd[@"index"] = @((*idx)++);
+                NSString *nid = FCB_idForObject(sub);
+                if (nid) nd[@"id"] = nid;
+                nd[@"class"] = NSStringFromClass([sub class]) ?: @"?";
+                nd[@"name"] = FCB_itemName(sub);
+                nd[@"lane"] = @"nested";
+                if (cid) nd[@"parent"] = cid;
+                nd[@"timeline_start_s"] = @(sstart);
+                nd[@"duration_s"] = @(sdur);
+                if (selected) nd[@"selected"] = @([selected containsObject:sub]);
+                [out addObject:nd];
+            }
+        }
+    } @catch (NSException *e) {}
 }
 
 static NSDictionary *FCB_timelineClips(void) {
@@ -524,9 +683,609 @@ static NSDictionary *FCB_timelineSelect(NSDictionary *params) {
     return result;
 }
 
-static NSDictionary *FCB_timelineReleaseHandles(void) {
-    [sHandleObjs removeAllObjects];
-    [sHandlePtrs removeAllObjects];
+// Read a no-arg double/float selector safely (encoding-checked; anything
+// else is skipped, never misread).
+static id FCB_probeDouble(id obj, NSString *name) {
+    SEL s = NSSelectorFromString(name);
+    if (![obj respondsToSelector:s]) return nil;
+    NSMethodSignature *sig = [obj methodSignatureForSelector:s];
+    if (!sig || [sig numberOfArguments] != 2) return nil;
+    const char *rt = [sig methodReturnType];
+    if (rt[0] != 'd' && rt[0] != 'f') return nil;
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    [inv setTarget:obj];
+    [inv setSelector:s];
+    @try { [inv invoke]; } @catch (NSException *e) { return nil; }
+    if (rt[0] == 'd') { double v = 0; [inv getReturnValue:&v]; return @(v); }
+    float v = 0; [inv getReturnValue:&v]; return @((double)v);
+}
+
+static NSDictionary *FCB_probeObject(id obj, NSString *label) {
+    NSArray *rangeSels = @[@"unclippedRange", @"sourceRange", @"mediaRange",
+        @"trimmedRange", @"sourceTimeRange", @"untrimmedRange", @"originalRange",
+        @"availableRange", @"referenceRange", @"anchoredRange", @"storyRange",
+        @"parentRange", @"clipMediaRange", @"sourceMediaRange", @"contentMediaRange",
+        @"timelineRange"];
+    NSArray *timeSels = @[@"sourceStartTime", @"mediaStartTime", @"trimStartTime",
+        @"startOffsetTime", @"sourceTime", @"mediaTime", @"unclippedStartTime",
+        @"inPoint", @"outPoint", @"sourceInPoint", @"sourceOutPoint",
+        @"mediaStart", @"sourceStart", @"startTime", @"anchorTime", @"anchoredOffset",
+        @"sourceAnchorTime", @"targetAnchorTime", @"localAnchorTime",
+        @"timelineAnchorOffset", @"timelineParentAnchorOffset",
+        @"localToParentOffset", @"parentToLocalOffset", @"timeOffset",
+        @"offsetExportValue"];
+    NSArray *dblSels = @[@"trimStart", @"trimEnd", @"trimDuration", @"sourceStart",
+        @"mediaStart", @"startOffset", @"sourceOffset", @"anchorOffset",
+        @"inPointValue", @"outPointValue", @"sourceIn", @"sourceOut"];
+    NSMutableDictionary *ranges = [NSMutableDictionary dictionary];
+    NSMutableDictionary *times = [NSMutableDictionary dictionary];
+    NSMutableDictionary *dbls = [NSMutableDictionary dictionary];
+    for (NSString *name in rangeSels) {
+        SEL s = NSSelectorFromString(name);
+        if (![obj respondsToSelector:s]) continue;
+        FCB_CMTimeRange u = {{0,0,0,0},{0,0,0,0}};
+        if (!FCB_structCall(obj, s, nil, &u)) continue;
+        ranges[name] = @{@"start_s": @(FCB_seconds(u.start)),
+                         @"duration_s": @(FCB_seconds(u.duration))};
+    }
+    for (NSString *name in timeSels) {
+        SEL s = NSSelectorFromString(name);
+        if (![obj respondsToSelector:s]) continue;
+        FCB_CMTime t = {0,0,0,0};
+        if (!FCB_structCall(obj, s, nil, &t) || t.timescale <= 0) continue;
+        times[name] = @{@"s": @(FCB_seconds(t)),
+                        @"v": @(t.value), @"ts": @(t.timescale)};
+    }
+    for (NSString *name in dblSels) {
+        id v = FCB_probeDouble(obj, name);
+        if (v) dbls[name] = v;
+    }
+    return @{@"label": label, @"class": NSStringFromClass([obj class]) ?: @"?",
+             @"duration_s": @(FCB_timeOf(obj, @selector(duration))),
+             @"ranges": ranges, @"times": times, @"doubles": dbls};
+}
+
+// Deep per-clip probe: the trim is not on FFAnchoredClip itself
+// (unclippedRange/mediaRange report the FULL media; timelineRange reports
+// the timeline position), so walk media -> clipRef -> first asset and probe
+// each. Read-only, one retained handle, explicit selector lists.
+static NSDictionary *FCB_debugRefs(NSDictionary *params) {
+    NSString *cid = params[@"id"];
+    if (![cid isKindOfClass:[NSString class]] || [cid length] == 0)
+        return @{@"error": @"id parameter required (see timeline.clips)"};
+    __block NSDictionary *result = nil;
+    FCB_runOnMain(^{
+        id timeline = FCB_activeTimeline();
+        if (!timeline) { result = @{@"error": @"No active timeline."}; return; }
+        id sequence = nil;
+        if ([timeline respondsToSelector:@selector(sequence)])
+            sequence = ((id (*)(id, SEL))objc_msgSend)(timeline, @selector(sequence));
+        if (!sequence) { result = @{@"error": @"No sequence in timeline."}; return; }
+        id target = sHandleObjs[cid];
+        if (!target) {
+            result = @{@"error": [NSString stringWithFormat:@"unknown id %@ — re-read timeline.clips", cid]};
+            return;
+        }
+        NSMutableArray<NSValue *> *live = FCB_livePointers(sequence);
+        if (![live containsObject:[NSValue valueWithPointer:(const void *)target]]) {
+            result = @{@"error": [NSString stringWithFormat:@"stale id %@ — re-read timeline.clips", cid]};
+            return;
+        }
+        NSMutableDictionary *refs = [NSMutableDictionary dictionary];
+        refs[@"clip"] = FCB_probeObject(target, @"clip");
+        @try {
+            id media = nil;
+            SEL mediaSel = NSSelectorFromString(@"media");
+            if ([target respondsToSelector:mediaSel])
+                media = ((id (*)(id, SEL))objc_msgSend)(target, mediaSel);
+            if (media) {
+                refs[@"media"] = FCB_probeObject(media, @"media");
+                id clipRef = nil;
+                SEL crSel = NSSelectorFromString(@"clipRef");
+                if ([target respondsToSelector:crSel])
+                    clipRef = ((id (*)(id, SEL))objc_msgSend)(target, crSel);
+                if (clipRef) {
+                    refs[@"clipRef"] = FCB_probeObject(clipRef, @"clipRef");
+                    id comp = nil;
+                    SEL fvSel = NSSelectorFromString(@"firstVideoAnchoredComponent");
+                    if (media && [media respondsToSelector:fvSel])
+                        comp = ((id (*)(id, SEL))objc_msgSend)(media, fvSel);
+                    if (!comp) {
+                        SEL ctSel = NSSelectorFromString(@"componentForTrim");
+                        if ([target respondsToSelector:ctSel])
+                            comp = ((id (*)(id, SEL))objc_msgSend)(target, ctSel);
+                    }
+                    if (comp) refs[@"component"] = FCB_probeObject(comp, @"component");
+                    // Sibling objects that may carry the source mapping:
+                    // audio component (this timeline is audio), story items.
+                    NSArray *getters = @[@"firstAudioAnchoredComponent",
+                        @"storylineClip", @"anchoredToStoryItem", @"parentStoryItem",
+                        @"storyline", @"primaryStoryItemComponent"];
+                    for (NSString *gname in getters) {
+                        SEL gs = NSSelectorFromString(gname);
+                        id holder = ([target respondsToSelector:gs]) ? target
+                            : ((media && [media respondsToSelector:gs]) ? media : nil);
+                        if (!holder) continue;
+                        id val = nil;
+                        @try { val = ((id (*)(id, SEL))objc_msgSend)(holder, gs); }
+                        @catch (NSException *e) { continue; }
+                        if (!val) continue;
+                        if ([val isKindOfClass:[NSArray class]] && [(NSArray *)val count] > 0)
+                            val = [(NSArray *)val objectAtIndex:0];
+                        if ([val isKindOfClass:[NSSet class]] && [(NSSet *)val count] > 0)
+                            val = [[(NSSet *)val allObjects] objectAtIndex:0];
+                        if (!val || [val isKindOfClass:[NSString class]] ||
+                            [val isKindOfClass:[NSNumber class]]) continue;
+                        @try { refs[gname] = FCB_probeObject(val, gname); }
+                        @catch (NSException *e) {}
+                    }
+                    // The clip's own members (video/audio components) — the
+                    // source mapping likely lives on FFAnchoredMediaComponent.
+                    SEL ciSel = NSSelectorFromString(@"containedItems");
+                    if ([target respondsToSelector:ciSel]) {
+                        id inner = ((id (*)(id, SEL))objc_msgSend)(target, ciSel);
+                        if ([inner isKindOfClass:[NSArray class]]) {
+                            NSMutableArray *kids = [NSMutableArray array];
+                            for (id sub in (NSArray *)inner)
+                                [kids addObject:FCB_probeObject(sub, @"child")];
+                            refs[@"children"] = kids;
+                        }
+                    }
+                    id assets = nil;
+                    SEL aSel = NSSelectorFromString(@"assets");
+                    if ([clipRef respondsToSelector:aSel])
+                        assets = ((id (*)(id, SEL))objc_msgSend)(clipRef, aSel);
+                    NSArray *arr = nil;
+                    if ([assets isKindOfClass:[NSSet class]]) arr = [(NSSet *)assets allObjects];
+                    else if ([assets isKindOfClass:[NSArray class]]) arr = assets;
+                    if ([arr count] > 0)
+                        refs[@"asset0"] = FCB_probeObject([arr objectAtIndex:0], @"asset0");
+                }
+            }
+        } @catch (NSException *e) {
+            refs[@"walk_error"] = e.reason ?: @"exception";
+        }
+        result = @{@"id": cid, @"refs": refs};
+    });
+    return result;
+}
+
+static NSDictionary *FCB_debugRanges(NSDictionary *params) {
+    NSString *cid = params[@"id"];
+    if (![cid isKindOfClass:[NSString class]] || [cid length] == 0)
+        return @{@"error": @"id parameter required (see timeline.clips)"};
+    __block NSDictionary *result = nil;
+    FCB_runOnMain(^{
+        id timeline = FCB_activeTimeline();
+        if (!timeline) { result = @{@"error": @"No active timeline."}; return; }
+        id sequence = nil;
+        if ([timeline respondsToSelector:@selector(sequence)])
+            sequence = ((id (*)(id, SEL))objc_msgSend)(timeline, @selector(sequence));
+        if (!sequence) { result = @{@"error": @"No sequence in timeline."}; return; }
+        id target = sHandleObjs[cid];
+        if (!target) {
+            result = @{@"error": [NSString stringWithFormat:@"unknown id %@ — re-read timeline.clips", cid]};
+            return;
+        }
+        NSMutableArray<NSValue *> *live = FCB_livePointers(sequence);
+        if (![live containsObject:[NSValue valueWithPointer:(const void *)target]]) {
+            result = @{@"error": [NSString stringWithFormat:@"stale id %@ — re-read timeline.clips", cid]};
+            return;
+        }
+        NSArray *rangeSels = @[@"unclippedRange", @"sourceRange", @"mediaRange",
+            @"trimmedRange", @"sourceTimeRange", @"untrimmedRange", @"originalRange",
+            @"availableRange", @"contentRange", @"clipRange", @"timelineRange",
+            @"effectRange", @"audioRange", @"videoRange"];
+        NSArray *timeSels = @[@"sourceStartTime", @"mediaStartTime", @"trimStartTime",
+            @"startOffsetTime", @"sourceTime", @"mediaTime", @"unclippedStartTime",
+            @"sourceAnchorTime", @"targetAnchorTime", @"localAnchorTime",
+            @"timelineAnchorOffset", @"timelineParentAnchorOffset",
+            @"localToParentOffset", @"parentToLocalOffset", @"timeOffset",
+            @"offsetExportValue"];
+        double dur = FCB_timeOf(target, @selector(duration));
+        NSMutableDictionary *ranges = [NSMutableDictionary dictionary];
+        NSMutableArray *rangeMiss = [NSMutableArray array];
+        for (NSString *name in rangeSels) {
+            SEL s = NSSelectorFromString(name);
+            if (![target respondsToSelector:s]) { [rangeMiss addObject:name]; continue; }
+            FCB_CMTimeRange u = {{0,0,0,0},{0,0,0,0}};
+            if (!FCB_structCall(target, s, nil, &u)) { [rangeMiss addObject:name]; continue; }
+            ranges[name] = @{@"start_s": @(FCB_seconds(u.start)),
+                             @"duration_s": @(FCB_seconds(u.duration))};
+        }
+        NSMutableDictionary *times = [NSMutableDictionary dictionary];
+        NSMutableArray *timeMiss = [NSMutableArray array];
+        for (NSString *name in timeSels) {
+            SEL s = NSSelectorFromString(name);
+            if (![target respondsToSelector:s]) { [timeMiss addObject:name]; continue; }
+            FCB_CMTime t = {0,0,0,0};
+            if (!FCB_structCall(target, s, nil, &t) || t.timescale <= 0) {
+                [timeMiss addObject:name]; continue;
+            }
+            times[name] = @(FCB_seconds(t));
+        }
+        double start = -1;
+        id primaryObj = nil;
+        if ([sequence respondsToSelector:@selector(primaryObject)])
+            primaryObj = ((id (*)(id, SEL))objc_msgSend)(sequence, @selector(primaryObject));
+        if (primaryObj) {
+            FCB_CMTimeRange r = {{0,0,0,0},{0,0,0,0}};
+            if (FCB_structCall(primaryObj, NSSelectorFromString(@"effectiveRangeOfObject:"), target, &r))
+                start = FCB_seconds(r.start);
+        }
+        result = @{@"id": cid, @"class": NSStringFromClass([target class]) ?: @"?",
+                   @"name": FCB_itemName(target),
+                   @"timeline_start_s": @(start), @"duration_s": @(dur),
+                   @"ranges": ranges, @"ranges_missing": rangeMiss,
+                   @"times": times, @"times_missing": timeMiss};
+    });
+    return result;
+}
+
+// Mirror-image probe: the spine maps objects to TIMELINE ranges via
+// effectiveRangeOfObject: — it may map to SOURCE ranges via a sibling
+// selector. Try each on primaryObject and sequence with the clip as arg.
+static NSDictionary *FCB_debugSpine(NSDictionary *params) {
+    NSString *cid = params[@"id"];
+    if (![cid isKindOfClass:[NSString class]] || [cid length] == 0)
+        return @{@"error": @"id parameter required (see timeline.clips)"};
+    __block NSDictionary *result = nil;
+    FCB_runOnMain(^{
+        id timeline = FCB_activeTimeline();
+        if (!timeline) { result = @{@"error": @"No active timeline."}; return; }
+        id sequence = nil;
+        if ([timeline respondsToSelector:@selector(sequence)])
+            sequence = ((id (*)(id, SEL))objc_msgSend)(timeline, @selector(sequence));
+        if (!sequence) { result = @{@"error": @"No sequence in timeline."}; return; }
+        id target = sHandleObjs[cid];
+        if (!target) {
+            result = @{@"error": [NSString stringWithFormat:@"unknown id %@ — re-read timeline.clips", cid]};
+            return;
+        }
+        id primaryObj = nil;
+        if ([sequence respondsToSelector:@selector(primaryObject)])
+            primaryObj = ((id (*)(id, SEL))objc_msgSend)(sequence, @selector(primaryObject));
+        NSArray *sels = @[@"effectiveRangeOfObject:", @"sourceRangeOfObject:",
+            @"mediaRangeOfObject:", @"unclippedRangeOfObject:", @"storyRangeOfObject:",
+            @"timelineRangeOfObject:", @"availableRangeOfObject:", @"contentRangeOfObject:",
+            @"rangeOfObject:", @"timeRangeOfObject:", @"storyElementRangeOfObject:"];
+        NSArray *hosts = primaryObj ? @[primaryObj, sequence] : @[sequence];
+        NSMutableDictionary *out = [NSMutableDictionary dictionary];
+        for (id host in hosts) {
+            NSString *hkey = (host == (id)primaryObj) ? @"primaryObject" : @"sequence";
+            NSMutableDictionary *hd = [NSMutableDictionary dictionary];
+            hd[@"class"] = NSStringFromClass([host class]) ?: @"?";
+            for (NSString *name in sels) {
+                SEL s = NSSelectorFromString(name);
+                if (![host respondsToSelector:s]) continue;
+                FCB_CMTimeRange r = {{0,0,0,0},{0,0,0,0}};
+                if (!FCB_structCall(host, s, target, &r)) continue;
+                hd[name] = @{@"start_s": @(FCB_seconds(r.start)),
+                             @"duration_s": @(FCB_seconds(r.duration))};
+            }
+            out[hkey] = hd;
+        }
+        result = @{@"id": cid, @"class": NSStringFromClass([target class]) ?: @"?",
+                   @"hosts": out};
+    });
+    return result;
+}
+
+// Systematic probe: list method names on the object's class hierarchy
+// matching a substring filter, with return-type encodings. Read-only,
+// one retained handle. Use to discover the real trim/source API instead
+// of guessing selector names.
+static NSDictionary *FCB_debugMethods(NSDictionary *params) {
+    NSString *cid = params[@"id"];
+    if (![cid isKindOfClass:[NSString class]] || [cid length] == 0)
+        return @{@"error": @"id parameter required (see timeline.clips)"};
+    NSString *filter = params[@"filter"];
+    if (![filter isKindOfClass:[NSString class]]) filter = @"";
+    __block NSDictionary *result = nil;
+    FCB_runOnMain(^{
+        id timeline = FCB_activeTimeline();
+        if (!timeline) { result = @{@"error": @"No active timeline."}; return; }
+        id sequence = nil;
+        if ([timeline respondsToSelector:@selector(sequence)])
+            sequence = ((id (*)(id, SEL))objc_msgSend)(timeline, @selector(sequence));
+        if (!sequence) { result = @{@"error": @"No sequence in timeline."}; return; }
+        id target = sHandleObjs[cid];
+        if (!target) {
+            result = @{@"error": [NSString stringWithFormat:@"unknown id %@ — re-read timeline.clips", cid]};
+            return;
+        }
+        NSMutableDictionary *out = [NSMutableDictionary dictionary];
+        Class cls = [target class];
+        int depth = 0;
+        while (cls && depth < 8) {
+            unsigned int n = 0;
+            Method *ml = class_copyMethodList(cls, &n);
+            NSMutableArray *names = [NSMutableArray array];
+            for (unsigned int i = 0; i < n && [names count] < 300; i++) {
+                NSString *name = NSStringFromSelector(method_getName(ml[i]));
+                if ([filter length] > 0 &&
+                    [name rangeOfString:filter options:NSCaseInsensitiveSearch].location == NSNotFound)
+                    continue;
+                char rt[8] = "?";
+                @try {
+                    NSMethodSignature *sig = [NSMethodSignature signatureWithObjCTypes:method_getTypeEncoding(ml[i])];
+                    if (sig) {
+                        const char *t = [sig methodReturnType];
+                        snprintf(rt, sizeof(rt), "%s", t ? t : "?");
+                    }
+                } @catch (NSException *e) {}
+                [names addObject:[NSString stringWithFormat:@"%s %@", rt, name]];
+            }
+            if (ml) free(ml);
+            out[NSStringFromClass(cls) ?: @"?"] = names;
+            cls = class_getSuperclass(cls);
+            depth++;
+        }
+        result = @{@"id": cid, @"filter": filter, @"hierarchy": out};
+    });
+    return result;
+}
+
+// Class-level probe: list method names (with return encodings) for a named
+// class + superclasses. Needs no timeline object — pure runtime reflection.
+static NSDictionary *FCB_debugClass(NSDictionary *params) {
+    NSString *name = params[@"class"];
+    if (![name isKindOfClass:[NSString class]] || [name length] == 0)
+        return @{@"error": @"class parameter required (e.g. FFAnchoredMediaComponent)"};
+    NSString *filter = params[@"filter"];
+    if (![filter isKindOfClass:[NSString class]]) filter = @"";
+    __block NSDictionary *result = nil;
+    FCB_runOnMain(^{
+        Class cls = objc_getClass([name UTF8String]);
+        if (!cls) { result = @{@"error": [NSString stringWithFormat:@"no class %@", name]}; return; }
+        NSMutableDictionary *out = [NSMutableDictionary dictionary];
+        int depth = 0;
+        while (cls && depth < 10) {
+            unsigned int n = 0;
+            Method *ml = class_copyMethodList(cls, &n);
+            NSMutableArray *names = [NSMutableArray array];
+            for (unsigned int i = 0; i < n && [names count] < 500; i++) {
+                NSString *mname = NSStringFromSelector(method_getName(ml[i]));
+                if ([filter length] > 0 &&
+                    [mname rangeOfString:filter options:NSCaseInsensitiveSearch].location == NSNotFound)
+                    continue;
+                char rt[16] = "?";
+                @try {
+                    NSMethodSignature *sig = [NSMethodSignature signatureWithObjCTypes:method_getTypeEncoding(ml[i])];
+                    if (sig) {
+                        const char *t = [sig methodReturnType];
+                        snprintf(rt, sizeof(rt), "%s", t ? t : "?");
+                    }
+                } @catch (NSException *e) {}
+                [names addObject:[NSString stringWithFormat:@"%s %@", rt, mname]];
+            }
+            if (ml) free(ml);
+            out[NSStringFromClass(cls) ?: @"?"] = names;
+            cls = class_getSuperclass(cls);
+            depth++;
+        }
+        result = @{@"class": name, @"filter": filter, @"hierarchy": out};
+    });
+    return result;
+}
+
+// Convert a clip's timeline edges through convertTime:toStoryline: /
+// convertTime:fromStoryline:. If toStoryline(timeline_start) yields the
+// source in-point, trim is directly computable with no more guessing.
+static NSDictionary *FCB_debugConvert(NSDictionary *params) {
+    NSString *cid = params[@"id"];
+    if (![cid isKindOfClass:[NSString class]] || [cid length] == 0)
+        return @{@"error": @"id parameter required (see timeline.clips)"};
+    __block NSDictionary *result = nil;
+    FCB_runOnMain(^{
+        id timeline = FCB_activeTimeline();
+        if (!timeline) { result = @{@"error": @"No active timeline."}; return; }
+        id sequence = nil;
+        if ([timeline respondsToSelector:@selector(sequence)])
+            sequence = ((id (*)(id, SEL))objc_msgSend)(timeline, @selector(sequence));
+        if (!sequence) { result = @{@"error": @"No sequence in timeline."}; return; }
+        id target = sHandleObjs[cid];
+        if (!target) {
+            result = @{@"error": [NSString stringWithFormat:@"unknown id %@ — re-read timeline.clips", cid]};
+            return;
+        }
+        double dur = FCB_timeOf(target, @selector(duration));
+        double start = -1;
+        id primaryObj = nil;
+        if ([sequence respondsToSelector:@selector(primaryObject)])
+            primaryObj = ((id (*)(id, SEL))objc_msgSend)(sequence, @selector(primaryObject));
+        if (primaryObj) {
+            FCB_CMTimeRange r = {{0,0,0,0},{0,0,0,0}};
+            if (FCB_structCall(primaryObj, NSSelectorFromString(@"effectiveRangeOfObject:"), target, &r))
+                start = FCB_seconds(r.start);
+        }
+        if (start < 0) { result = @{@"error": @"cannot resolve timeline start"}; return; }
+        NSMutableDictionary *out = [NSMutableDictionary dictionary];
+        for (NSString *name in @[@"convertTime:toStoryline:", @"convertTime:fromStoryline:"]) {
+            SEL s = NSSelectorFromString(name);
+            if (![target respondsToSelector:s]) { out[name] = @"missing"; continue; }
+            NSMethodSignature *sig = [target methodSignatureForSelector:s];
+            if (!sig || [sig numberOfArguments] != 3) { out[name] = @"bad-sig"; continue; }
+            NSMutableDictionary *sd = [NSMutableDictionary dictionary];
+            for (NSNumber *edge in @[@(start), @(start + dur)]) {
+                double es = [edge doubleValue];
+                FCB_CMTime inT;
+                inT.value = (int64_t)(es * 600000.0);
+                inT.timescale = 600000;
+                inT.flags = 1;
+                inT.epoch = 0;
+                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                [inv setTarget:target];
+                [inv setSelector:s];
+                [inv setArgument:&inT atIndex:2];
+                @try { [inv invoke]; }
+                @catch (NSException *e) { sd[[edge stringValue]] = @"invoke-fail"; continue; }
+                FCB_CMTime ret = {0,0,0,0};
+                @try { [inv getReturnValue:&ret]; }
+                @catch (NSException *e) { sd[[edge stringValue]] = @"read-fail"; continue; }
+                sd[[edge stringValue]] = @{@"s": @(FCB_seconds(ret)),
+                                           @"v": @(ret.value), @"ts": @(ret.timescale)};
+            }
+            out[name] = sd;
+        }
+        result = @{@"id": cid, @"timeline_start_s": @(start), @"duration_s": @(dur),
+                   @"convert": out};
+    });
+    return result;
+}
+
+// Systematic getter sweep: call every no-arg object-returning method whose
+// name smells like a sub-object, probe each result. Finds the per-clip
+// component carrying the source mapping without guessing API names.
+// Skips init/dealloc/new/copy families (never call those on live objects).
+static NSDictionary *FCB_debugGetters(NSDictionary *params) {
+    NSString *cid = params[@"id"];
+    if (![cid isKindOfClass:[NSString class]] || [cid length] == 0)
+        return @{@"error": @"id parameter required (see timeline.clips)"};
+    __block NSDictionary *result = nil;
+    FCB_runOnMain(^{
+        id timeline = FCB_activeTimeline();
+        if (!timeline) { result = @{@"error": @"No active timeline."}; return; }
+        id sequence = nil;
+        if ([timeline respondsToSelector:@selector(sequence)])
+            sequence = ((id (*)(id, SEL))objc_msgSend)(timeline, @selector(sequence));
+        if (!sequence) { result = @{@"error": @"No sequence in timeline."}; return; }
+        id target = sHandleObjs[cid];
+        if (!target) {
+            result = @{@"error": [NSString stringWithFormat:@"unknown id %@ — re-read timeline.clips", cid]};
+            return;
+        }
+        NSArray *smells = @[@"component", @"audio", @"video", @"element", @"child",
+            @"member", @"part", @"source", @"media", @"clip", @"story", @"anchor",
+            @"track", @"item", @"content", @"segment"];
+        NSArray *banned = @[@"init", @"dealloc", @"new", @"copy", @"mutableCopy",
+            @"retain", @"release", @"autorelease", @"set"];
+        NSMutableDictionary *out = [NSMutableDictionary dictionary];
+        NSMutableSet *seen = [NSMutableSet set];
+        Class cls = [target class];
+        int depth = 0;
+        while (cls && depth < 10 && [out count] < 40) {
+            unsigned int n = 0;
+            Method *ml = class_copyMethodList(cls, &n);
+            for (unsigned int i = 0; i < n && [out count] < 40; i++) {
+                NSString *mname = NSStringFromSelector(method_getName(ml[i]));
+                BOOL hit = NO;
+                for (NSString *s in smells) {
+                    if ([mname rangeOfString:s options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                        hit = YES; break;
+                    }
+                }
+                if (!hit || [seen containsObject:mname]) continue;
+                [seen addObject:mname];
+                BOOL bad = NO;
+                for (NSString *b in banned) {
+                    if ([mname hasPrefix:b]) { bad = YES; break; }
+                }
+                if (bad) continue;
+                NSMethodSignature *sig = nil;
+                @try { sig = [NSMethodSignature signatureWithObjCTypes:method_getTypeEncoding(ml[i])]; }
+                @catch (NSException *e) { continue; }
+                if (!sig || [sig numberOfArguments] != 2) continue;
+                const char *rt = [sig methodReturnType];
+                if (!rt || rt[0] != '@') continue;
+                SEL s = NSSelectorFromString(mname);
+                if (![target respondsToSelector:s]) continue;
+                id val = nil;
+                @try { val = ((id (*)(id, SEL))objc_msgSend)(target, s); }
+                @catch (NSException *e) { continue; }
+                if (!val) continue;
+                if ([val isKindOfClass:[NSArray class]] && [(NSArray *)val count] > 0)
+                    val = [(NSArray *)val objectAtIndex:0];
+                else if ([val isKindOfClass:[NSSet class]] && [(NSSet *)val count] > 0)
+                    val = [[(NSSet *)val allObjects] objectAtIndex:0];
+                if (!val || [val isKindOfClass:[NSString class]] ||
+                    [val isKindOfClass:[NSNumber class]] ||
+                    [val isKindOfClass:[NSValue class]]) continue;
+                @try { out[mname] = FCB_probeObject(val, mname); }
+                @catch (NSException *e) {}
+            }
+            if (ml) free(ml);
+            cls = class_getSuperclass(cls);
+            depth++;
+        }
+        result = @{@"id": cid, @"getters": out};
+    });
+    return result;
+}
+
+// Dump EVERY member of anchoredTimelineItems plus alternate self-views,
+// with the fields that matter. Decides the production trim strategy.
+static NSDictionary *FCB_debugHops(NSDictionary *params) {
+    NSString *cid = params[@"id"];
+    if (![cid isKindOfClass:[NSString class]] || [cid length] == 0)
+        return @{@"error": @"id parameter required (see timeline.clips)"};
+    __block NSDictionary *result = nil;
+    FCB_runOnMain(^{
+        id timeline = FCB_activeTimeline();
+        if (!timeline) { result = @{@"error": @"No active timeline."}; return; }
+        id sequence = nil;
+        if ([timeline respondsToSelector:@selector(sequence)])
+            sequence = ((id (*)(id, SEL))objc_msgSend)(timeline, @selector(sequence));
+        if (!sequence) { result = @{@"error": @"No sequence in timeline."}; return; }
+        id target = sHandleObjs[cid];
+        if (!target) {
+            result = @{@"error": [NSString stringWithFormat:@"unknown id %@ — re-read timeline.clips", cid]};
+            return;
+        }
+        NSMutableArray *members = [NSMutableArray array];
+        @try {
+            SEL aiSel = NSSelectorFromString(@"anchoredTimelineItems");
+            if ([target respondsToSelector:aiSel]) {
+                id arr = ((id (*)(id, SEL))objc_msgSend)(target, aiSel);
+                NSArray *list = nil;
+                if ([arr isKindOfClass:[NSArray class]]) list = arr;
+                else if ([arr isKindOfClass:[NSSet class]]) list = [(NSSet *)arr allObjects];
+                for (id hop in list ?: @[]) {
+                    NSMutableDictionary *m = [NSMutableDictionary dictionary];
+                    m[@"class"] = NSStringFromClass([hop class]) ?: @"?";
+                    m[@"ptr"] = [NSString stringWithFormat:@"%p ==target:%@",
+                        hop, (hop == target) ? @"YES" : @"NO"];
+                    FCB_CMTimeRange tr = {{0,0,0,0},{0,0,0,0}};
+                    if (FCB_structCall(hop, NSSelectorFromString(@"timelineRange"), nil, &tr))
+                        m[@"timelineRange"] = @{@"start_s": @(FCB_seconds(tr.start)),
+                                                @"duration_s": @(FCB_seconds(tr.duration))};
+                    for (NSString *nm in @[@"sourceAnchorTime", @"localAnchorTime"]) {
+                        SEL ts = NSSelectorFromString(nm);
+                        if (![hop respondsToSelector:ts]) continue;
+                        FCB_CMTime t = {0,0,0,0};
+                        if (!FCB_structCall(hop, ts, nil, &t) || t.timescale <= 0) continue;
+                        m[nm] = @(FCB_seconds(t));
+                    }
+                    [members addObject:m];
+                }
+            }
+        } @catch (NSException *e) { members = [@[@{@"error": @"exception"}] mutableCopy]; }
+        NSMutableDictionary *views = [NSMutableDictionary dictionary];
+        for (NSString *gname in @[@"videoComponent", @"primaryItemComponent",
+             @"primaryStoryItemComponent", @"storylineClip", @"inspectableAnchoredObject",
+             @"asFFAnchoredObject", @"anchoredToStoryItem", @"storyline"]) {
+            SEL gs = NSSelectorFromString(gname);
+            if (![target respondsToSelector:gs]) continue;
+            id val = nil;
+            @try { val = ((id (*)(id, SEL))objc_msgSend)(target, gs); }
+            @catch (NSException *e) { continue; }
+            if (!val || [val isKindOfClass:[NSString class]] ||
+                [val isKindOfClass:[NSNumber class]]) continue;
+            NSMutableDictionary *vd = [NSMutableDictionary dictionary];
+            vd[@"class"] = NSStringFromClass([val class]) ?: @"?";
+            vd[@"isTarget"] = @((val == target) ? YES : NO);
+            FCB_CMTime t = {0,0,0,0};
+            if (FCB_structCall(val, NSSelectorFromString(@"sourceAnchorTime"), nil, &t)
+                && t.timescale > 0)
+                vd[@"sourceAnchorTime"] = @(FCB_seconds(t));
+            views[gname] = vd;
+        }
+        result = @{@"id": cid, @"members": members, @"views": views};
+    });
+    return result;
+}
+
+static NSDictionary *FCB_timelineReleaseHandles(void) {    [sHandleObjs removeAllObjects];    [sHandlePtrs removeAllObjects];
     return @{@"released": @YES};
 }
 
@@ -575,6 +1334,14 @@ static NSDictionary *FCB_dispatch(NSString *method, NSDictionary *params) {
     if ([method isEqualToString:@"system.version"]) return FCB_systemVersion();
     if ([method isEqualToString:@"timeline.clips"]) return FCB_timelineClips();
     if ([method isEqualToString:@"timeline.select"]) return FCB_timelineSelect(params);
+    if ([method isEqualToString:@"timeline.debug_ranges"]) return FCB_debugRanges(params);
+    if ([method isEqualToString:@"timeline.debug_refs"]) return FCB_debugRefs(params);
+    if ([method isEqualToString:@"timeline.debug_spine"]) return FCB_debugSpine(params);
+    if ([method isEqualToString:@"timeline.debug_methods"]) return FCB_debugMethods(params);
+    if ([method isEqualToString:@"timeline.debug_class"]) return FCB_debugClass(params);
+    if ([method isEqualToString:@"timeline.debug_convert"]) return FCB_debugConvert(params);
+    if ([method isEqualToString:@"timeline.debug_getters"]) return FCB_debugGetters(params);
+    if ([method isEqualToString:@"timeline.debug_hops"]) return FCB_debugHops(params);
     if ([method isEqualToString:@"timeline.release_handles"]) return FCB_timelineReleaseHandles();
     if ([method isEqualToString:@"timeline.undo"]) return FCB_undoRedo(YES);
     if ([method isEqualToString:@"timeline.redo"]) return FCB_undoRedo(NO);

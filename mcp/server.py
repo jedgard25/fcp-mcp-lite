@@ -40,7 +40,11 @@ REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # is talking to the latest checkout. (The injected dylib carries its own
 # FCB_VERSION in bridge/FCPBridge.m — the two versions are independent
 # and reported side-by-side.)
-__version__ = "0.2.0"
+__version__ = "0.3.1"
+# Transcript-cache schema. Bumped on any words/cache layout change; the key
+# AND the payload both carry it, so an upgrade never dead-ends on a stale
+# cache hit ("safe to reuse but not when our schema changes").
+SCHEMA_VERSION = 3
 SILENCE_BIN = ["swift", os.path.join(REPO_DIR, "tools", "silence-detector.swift")]
 PARAKEET_BIN = os.path.join(
     REPO_DIR, "tools", "parakeet-transcriber", ".build", "release", "parakeet-transcriber"
@@ -147,7 +151,10 @@ def _resolve_id(rpc, clip_id: str) -> dict:
 
 
 def _file_to_timeline(clip: dict, file_s: float) -> float:
-    return clip["timeline_start_s"] + (file_s - clip.get("trim_start_s", 0))
+    t = _effective_trim(clip)
+    if t is None:
+        t = float(clip.get("trim_start_s", 0) or 0)
+    return clip["timeline_start_s"] + (file_s - t)
 
 
 def _all_existing_clips(rpc) -> list:
@@ -169,7 +176,9 @@ def _all_existing_clips(rpc) -> list:
 
 def _clip_file_window(clip: dict) -> tuple:
     """File interval [f0, f1] currently carried by this clip."""
-    f0 = float(clip.get("trim_start_s", 0))
+    f0 = _effective_trim(clip)
+    if f0 is None:  # candidates disagree — reads go best-effort on the raw value
+        f0 = float(clip.get("trim_start_s", 0) or 0)
     return (f0, f0 + float(clip.get("duration_s", 0)))
 
 
@@ -186,14 +195,81 @@ def _merge_spans(spans: list, gap: float = 0.02) -> list:
     return [(round(a, 3), round(b, 3)) for a, b in out]
 
 
-def _resolve_file_interval(clips: list, media_path: str, fa: float, fb: float) -> list:
+def _effective_trim(clip: dict) -> float | None:
+    """Best-known source-file offset for a clip.
+
+    Prefers the bridge's `trim_candidates` consensus (see bridge 0.2.0):
+    nonzero candidates must agree (within a frame); exact-0 votes are
+    abstentions, not votes, because `unclippedRange` is known to fail to 0.
+    Two different NONZERO candidates → None (unknown — the caller must
+    block, never guess). Unanimous zero → 0.0 (the degenerate signal is
+    handled by _trim_health). Without candidates (old bridge) falls back
+    to `trim_start_s`.
+    """
+    cands = clip.get("trim_candidates")
+    if cands:
+        try:
+            vals = [float(v) for v in cands.values()]
+        except (TypeError, ValueError):
+            return None
+        nz = [v for v in vals if v > 0]
+        if nz:
+            if max(nz) - min(nz) > 0.05:
+                return None
+            return max(nz)
+        return 0.0
+    return float(clip.get("trim_start_s", 0) or 0)
+
+
+def _trim_health(clips: list) -> list:
+    """Source files whose multi-clip layout is unresolvable.
+
+    The bridge reports trim_start_s via `unclippedRange`, which currently
+    fails and returns 0 for every bladed clip. A single-clip timeline is
+    unaffected (trim 0 is correct there), but with >1 clip sharing a source
+    file the mapping is ambiguous when trims are unknown: every clip claims
+    to carry file [0, duration]. Unknown means all trims read 0 (old bridge)
+    or the bridge's own candidates disagree (new bridge, trim_candidates).
+    Returns the list of affected media paths. Cuts on those files must
+    REFUSE (block, never wrong-cut); reads proceed best-effort with a
+    `trim_degenerate` flag.
+    """
+    by_file: dict = {}
+    for c in clips:
+        mp = c.get("media_path")
+        if mp:
+            by_file.setdefault(mp, []).append(c)
+    bad = []
+    for mp, cs in by_file.items():
+        if len(cs) < 2:
+            continue
+        eff = [_effective_trim(c) for c in cs]
+        if any(t is None for t in eff) or all(t == 0 for t in eff):
+            bad.append(mp)
+    return bad
+
+
+def _resolve_file_interval(clips: list, media_path: str, fa: float, fb: float,
+                           strict: bool = False) -> list:
     """Map a FILE interval to current TIMELINE fragments.
 
     Source of truth for chained edits (Bug 1 fix): file times never move,
     so after each cut we re-resolve against the live clip layout instead
     of trusting timeline times stamped at transcribe time. Returns [] when
     the whole interval was already cut away.
+
+    strict=True (cut planning): raises on degenerate trim layouts instead
+    of returning fiction — a wrong outer span could cut nearly the whole
+    timeline. strict=False (reads): best effort; callers must surface the
+    `trim_degenerate` flag from _trim_health.
     """
+    if strict and media_path in _trim_health(clips):
+        raise BridgeError(
+            "trim_start_s is 0 for every clip sharing "
+            f"{media_path[:80]}… (bridge unclippedRange bug) — file→timeline "
+            "is ambiguous, refusing to plan cuts. Fix the bridge (see "
+            "docs/bridge.md), then re-read get_timeline."
+        )
     frags = []
     for c in clips:
         if c.get("media_path") != media_path:
@@ -308,7 +384,7 @@ def _isolate_span(rpc, a: float, b: float) -> tuple:
     return seg["id"], blades
 
 
-def _cut_spans(rpc, spans: list, label: str) -> dict:
+def _cut_spans(rpc, spans: list, label: str, max_spans: int | None = None) -> dict:
     """Delete each [a, b] (timeline seconds), right-to-left so offsets hold.
 
     Per span: blade at both ends (skipped at existing edit points),
@@ -317,17 +393,32 @@ def _cut_spans(rpc, spans: list, label: str) -> dict:
     impossible by construction.
     Returns report with the TRUE undo depth (blades actually issued +
     deletes), so `undo(steps=report["undo_steps"])` restores one call.
+
+    max_spans (chunking): cut only the RIGHTMOST `max_spans` spans and
+    report the rest as `pending` (still valid timeline seconds — cutting
+    right-to-left never shifts earlier spans, and file-anchored planners
+    re-resolve anyway). Loop until `remaining` is 0. This keeps each call
+    under the MCP client timeout: ~0.8s/span means 169 spans ≈ 140s in one
+    call (server finishes, session drops), but 20 spans ≈ 16s per call.
     """
+    spans = _merge_spans([(float(a), float(b)) for a, b in spans])
+    spans = [(a, b) for a, b in spans if b > a]
     if not spans:
         return {"removed": 0, "removed_s": 0.0, "undo_steps": 0}
+    desc = sorted(spans, reverse=True)
+    pending: list = []
+    if max_spans is not None and len(desc) > max_spans:
+        desc, pending = desc[:max_spans], desc[max_spans:]
     before = _clips(rpc)
     dur_before = before.get("duration_s", 0)
+    total = dur_before
+    for a, b in desc:
+        if not (0 <= a < b <= total + 0.05):
+            raise BridgeError(f"span [{a}, {b}] outside timeline (0, {total:.3f}) — re-plan")
     removed_s = 0.0
     steps = 0
     undos = 0
-    for a, b in sorted(spans, reverse=True):
-        if b <= a:
-            continue
+    for a, b in desc:
         _, blades = _isolate_span(rpc, a, b)
         rpc("timeline.action", {"action": "delete"})
         removed_s += b - a
@@ -337,7 +428,7 @@ def _cut_spans(rpc, spans: list, label: str) -> dict:
     dur_after = after.get("duration_s", 0)
     expected = dur_before - removed_s
     ok = abs(dur_after - expected) < 0.15  # within ~4 frames @24fps
-    return {
+    report = {
         "removed": steps,
         "removed_s": round(removed_s, 3),
         "duration_before_s": round(dur_before, 3),
@@ -345,6 +436,14 @@ def _cut_spans(rpc, spans: list, label: str) -> dict:
         "undo_steps": undos,
         "verify": "ok" if ok else f"MISMATCH expected={expected:.3f}s actual={dur_after:.3f}s — undo(steps={undos}) to revert",
     }
+    if pending:
+        report["remaining"] = len(pending)
+        report["pending"] = pending  # rightmost-first order; cut these next
+        report["note"] = (f"chunked: cut {steps}, {len(pending)} pending — "
+                          "re-call with the same args until remaining is 0")
+    else:
+        report["remaining"] = 0
+    return report
 
 
 # ---------------------------------------------------------------- reads
@@ -398,16 +497,74 @@ def get_playhead() -> dict:
 SILENCE_FRAME = 1 / 30  # sub-frame slivers are uncuttable; drop them
 
 
-def _silence_scan(rpc, threshold_db: float, min_duration_s: float, for_cut: bool, pad_s: float) -> tuple:
+def _word_guard_intervals(media_path: str, margin_s: float) -> list:
+    """Speech intervals (FILE seconds) expanded by margin_s, merged.
+
+    File times are immutable across edits, so the cached transcript is a
+    valid guard even after the timeline rippled. Returns [] when no usable
+    transcript exists for this file (caller proceeds unguarded).
+    """
+    try:
+        t = _last_transcript()
+    except Exception:
+        return []
+    if not t or t.get("media_path") != media_path:
+        return []
+    words = t.get("words", [])
+    if words and "f_start" not in words[0]:
+        return []
+    ivs = sorted((float(w["f_start"]) - margin_s, float(w["f_end"]) + margin_s)
+                 for w in words if "f_start" in w and "f_end" in w)
+    out = []
+    for a, b in ivs:
+        if out and a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return out
+
+
+def _subtract_intervals(base_a: float, base_b: float, cuts: list) -> list:
+    """Subtract sorted merged `cuts` from [base_a, base_b]; return remainders."""
+    out, cur = [], base_a
+    for a, b in cuts:
+        if b <= cur or a >= base_b:
+            continue
+        if a > cur:
+            out.append((cur, min(a, base_b)))
+        cur = max(cur, b)
+        if cur >= base_b:
+            break
+    if cur < base_b:
+        out.append((cur, base_b))
+    return out
+
+
+def _silence_scan(rpc, threshold_db: float, min_duration_s: float, for_cut: bool, pad_s: float,
+                  word_guard_s: float = 0.3) -> tuple:
     """Run the detector once per unique source file, map hits into every
     on-disk primary clip carrying that file (Bug 3 fix).
 
     Python owns padding (the detector is always invoked with --padding 0,
     so pad_s is applied exactly once here): detect expands raw silence by
     pad and clamps to the clip; remove insets by pad so speech breathes.
-    Returns (spans, per_file) with spans merged timeline seconds.
+    When cutting (for_cut), speech intervals from the cached transcript
+    (expanded by word_guard_s) are subtracted from each silence BEFORE
+    mapping — the 2026-09-22 cut proved a fixed -34 dB threshold alone
+    eats word onsets/offsets (132/169 spans overlapped words). for_cut on
+    a degenerate trim layout raises instead of mapping fiction (see
+    _trim_health). Returns (spans, per_file) with spans merged timeline seconds.
     """
     clips = _all_existing_clips(rpc)
+    if for_cut:
+        bad = _trim_health(clips)
+        if bad:
+            raise BridgeError(
+                "trim_start_s is 0 for every clip sharing "
+                f"{bad[0][:80]}… (bridge unclippedRange bug) — silence hits "
+                "cannot be mapped, refusing to plan cuts. Fix the bridge "
+                "(see docs/bridge.md), then retry."
+            )
     by_file: dict = {}
     for c in clips:
         by_file.setdefault(c["media_path"], []).append(c)
@@ -421,29 +578,41 @@ def _silence_scan(rpc, threshold_db: float, min_duration_s: float, for_cut: bool
         ]
         res = json.loads(_run(cmd, timeout=300))
         mapped = 0
+        guarded_hits = 0
+        guard = _word_guard_intervals(path, word_guard_s) if for_cut else []
         for r in res.get("silentRanges", []):
             fs, fe = float(r["start"]), float(r["start"]) + float(r["duration"])
-            for c in fclips:
-                f0, f1 = _clip_file_window(c)
-                lo, hi = max(fs, f0), min(fe, f1)
-                if hi <= lo:
-                    continue
-                base = float(c["timeline_start_s"])
-                if for_cut:
-                    a = base + (lo - f0) + pad_s
-                    b = base + (hi - f0) - pad_s
-                    a = max(a, base)
-                    b = min(b, base + float(c["duration_s"]))
-                    if b - a >= SILENCE_FRAME:
-                        spans.append((round(a, 3), round(b, 3)))
-                        mapped += 1
-                else:
+            # Word guard (cut path only): never cut over speech. Subtract
+            # first in FILE space so the pad inset below only ever shrinks
+            # true inter-word gaps.
+            pieces = _subtract_intervals(fs, fe, guard) if guard else [(fs, fe)]
+            if for_cut and guard and sum(b - a for a, b in pieces) < (fe - fs) - 1e-9:
+                guarded_hits += 1
+            for ps, pe in pieces:
+                for c in fclips:
+                    f0, f1 = _clip_file_window(c)
+                    lo, hi = max(ps, f0), min(pe, f1)
+                    if hi <= lo:
+                        continue
+                    base = float(c["timeline_start_s"])
+                    if for_cut:
+                        a = base + (lo - f0) + pad_s
+                        b = base + (hi - f0) - pad_s
+                        a = max(a, base)
+                        b = min(b, base + float(c["duration_s"]))
+                        if b - a >= SILENCE_FRAME:
+                            spans.append((round(a, 3), round(b, 3)))
+                            mapped += 1
+                        continue
                     a = max(base + (lo - f0) - pad_s, base)
                     b = min(base + (hi - f0) + pad_s, base + float(c["duration_s"]))
                     if b > a:
                         spans.append((round(a, 3), round(b, 3)))
                         mapped += 1
-        per_file.append({"file": path, "clips": len(fclips), "hits": mapped})
+        entry = {"file": path, "clips": len(fclips), "hits": mapped}
+        if for_cut and guarded_hits:
+            entry["word_guarded"] = guarded_hits
+        per_file.append(entry)
     return _merge_spans(spans), per_file
 
 
@@ -464,7 +633,7 @@ def _silence_warning(spans: list, rpc=None, duration_s: float | None = None) -> 
 
 @mcp.tool()
 def detect_silences(
-    threshold_db: float = -34.0, min_duration_s: float = 0.5, pad_s: float = 0.1
+    threshold_db: float = -34.0, min_duration_s: float = 0.5, pad_s: float = 0.2
 ) -> dict:
     """Find silent spans via native AVFoundation analysis of the source files.
 
@@ -478,9 +647,16 @@ def detect_silences(
         spans, per_file = _silence_scan(rpc, threshold_db, min_duration_s, False, pad_s)
         state = _clips(rpc)
         warn = _silence_warning(spans, duration_s=state.get("duration_s", 0))
-        return {"clips_scanned": sum(f["clips"] for f in per_file), "files": per_file,
-                "silences": [{"start_s": a, "end_s": b} for a, b in spans],
-                "count": len(spans), **warn}
+        out = {"clips_scanned": sum(f["clips"] for f in per_file), "files": per_file,
+               "silences": [{"start_s": a, "end_s": b} for a, b in spans],
+               "count": len(spans), **warn}
+        bad = _trim_health(state.get("clips", []))
+        if bad:
+            out["trim_degenerate"] = bad
+            out["trim_note"] = ("bridge reports trim_start_s=0 for every clip sharing "
+                                "these files — detect positions are best-effort and "
+                                "cuts are blocked until the bridge is fixed")
+        return out
 
     return logged("detect_silences", args, run)
 
@@ -489,23 +665,40 @@ def detect_silences(
 def remove_silences(
     threshold_db: float = -34.0,
     min_duration_s: float = 0.5,
-    pad_s: float = 0.1,
+    pad_s: float = 0.2,
     dry_run: bool = True,
+    max_spans: int | None = None,
+    word_guard_s: float = 0.3,
 ) -> dict:
     """Cut every silence (pad kept each side so speech breathes).
 
-    dry_run=True (default) returns the cut list without writing.
+    dry_run=True (default) returns the cut list without writing. Speech from
+    the cached transcript (expanded by word_guard_s) is subtracted from each
+    silence before cutting, so a hot threshold can't eat word onsets.
+    For large cut lists pass max_spans=N (e.g. 20): cuts the rightmost N,
+    returns `pending` — re-call with the same args (file-anchored spans
+    re-resolve, so chunking is safe) until `remaining` is 0. Sum each call's
+    `undo_steps` for a full revert. Each chunk is logged: `make logs` shows
+    progress live.
     """
 
     args = {"threshold_db": threshold_db, "min_duration_s": min_duration_s,
-            "pad_s": pad_s, "dry_run": dry_run}
+            "pad_s": pad_s, "dry_run": dry_run, "max_spans": max_spans,
+            "word_guard_s": word_guard_s}
 
     def run(rpc):
-        spans, per_file = _silence_scan(rpc, threshold_db, min_duration_s, True, pad_s)
+        try:
+            spans, per_file = _silence_scan(rpc, threshold_db, min_duration_s, True,
+                                            pad_s, word_guard_s)
+        except BridgeError as e:
+            return {"ok": False, "error": str(e)}
         warn = _silence_warning(spans, rpc)
         if dry_run or not spans:
             return {"dry_run": dry_run, "files": per_file, "spans": spans, **warn}
-        report = _cut_spans(rpc, spans, "remove_silences")
+        try:
+            report = _cut_spans(rpc, spans, "remove_silences", max_spans)
+        except BridgeError as e:
+            return {"ok": False, "error": str(e)}
         report["files"] = per_file
         if warn["warning"]:
             report["warning"] = warn["warning"]
@@ -515,13 +708,46 @@ def remove_silences(
 
 
 @mcp.tool()
-def apply_cut_list(keep_ranges: list, dry_run: bool = True) -> dict:
+def cut_spans(spans: list, dry_run: bool = True, max_spans: int | None = None) -> dict:
+    """Cut explicit timeline-second spans [[a, b], ...], right-to-left.
+
+    The chunk executor: validate whole, cut at most `max_spans` (rightmost
+    first), report `pending` for the next call. Loop until `remaining` is 0,
+    then sum each call's `undo_steps` for a full revert. Every call is
+    logged, so `make logs` shows progress live.
+    """
+    args = {"spans": spans, "dry_run": dry_run, "max_spans": max_spans}
+
+    def run(rpc):
+        try:
+            clean = _merge_spans([(float(a), float(b)) for a, b in spans])
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "spans must be [[start_s, end_s], ...]"}
+        if dry_run:
+            return {"dry_run": True, "spans": clean,
+                    "would_remove_s": round(sum(b - a for a, b in clean), 3),
+                    "count": len(clean)}
+        try:
+            return {"ok": True, **_cut_spans(rpc, clean, "cut_spans", max_spans)}
+        except BridgeError as e:
+            return {"ok": False, "error": str(e)}
+
+    return logged("cut_spans", args, run)
+
+
+@mcp.tool()
+def apply_cut_list(keep_ranges: list, dry_run: bool = True,
+                   max_spans: int | None = None) -> dict:
     """Rough cut in one verb: keep [[start_s, end_s]...], drop the rest, close gaps.
 
     Ranges validated whole (sorted, non-overlapping, inside the timeline) before
     any write. Cuts run right-to-left so offsets hold; duration verified after.
+    For large drops pass max_spans=N (e.g. 20): cuts the rightmost N drops,
+    returns `pending` — finish with cut_spans(pending) (same spans stay valid
+    because right-to-left cuts never shift earlier positions), looping until
+    `remaining` is 0. Sum each call's `undo_steps` for a full revert.
     """
-    args = {"keep_ranges": keep_ranges, "dry_run": dry_run}
+    args = {"keep_ranges": keep_ranges, "dry_run": dry_run, "max_spans": max_spans}
 
     def run(rpc):
         state = _clips(rpc)
@@ -547,7 +773,10 @@ def apply_cut_list(keep_ranges: list, dry_run: bool = True) -> dict:
         if dry_run or not drops:
             return {"dry_run": dry_run, "keep": ranges, "drop": drops,
                     "would_remove_s": round(sum(b - a for a, b in drops), 3)}
-        report = _cut_spans(rpc, drops, "apply_cut_list")
+        try:
+            report = _cut_spans(rpc, drops, "apply_cut_list", max_spans)
+        except BridgeError as e:
+            return {"ok": False, "error": str(e)}
         report["kept"] = len(ranges)
         return report
 
@@ -559,7 +788,9 @@ def apply_cut_list(keep_ranges: list, dry_run: bool = True) -> dict:
 
 def _cache_key(media_path: str, engine: str, model: str) -> str:
     st = os.stat(media_path)
-    h = hashlib.sha1(f"{media_path}|{st.st_mtime_ns}|{st.st_size}|{engine}|{model}".encode())
+    h = hashlib.sha1(
+        f"{media_path}|{st.st_mtime_ns}|{st.st_size}|{engine}|{model}|schema{SCHEMA_VERSION}".encode()
+    )
     return h.hexdigest()[:16]
 
 
@@ -597,12 +828,16 @@ def _load_cache(key: str) -> dict | None:
     p = os.path.join(CACHE_DIR, key + ".json")
     if os.path.exists(p):
         with open(p) as f:
-            return json.load(f)
+            data = json.load(f)
+        if data.get("schema") != SCHEMA_VERSION:
+            return None  # stale schema: cache MISS (forces re-transcribe, never dead-ends)
+        return data
     return None
 
 
 def _save_cache(key: str, data: dict) -> None:
     os.makedirs(CACHE_DIR, exist_ok=True)
+    data["schema"] = SCHEMA_VERSION
     with open(os.path.join(CACHE_DIR, key + ".json"), "w") as f:
         json.dump(data, f)
     with open(STATE_PATH, "w") as f:
@@ -651,6 +886,12 @@ def transcribe(engine: str = "parakeet", model: str = "v3") -> dict:
         clip = _existing_clip(rpc)
         key = _cache_key(clip["media_path"], engine, model)
         cached = _load_cache(key)
+        # Legacy schema (predates file-relative times): the upgrade error
+        # would dead-end forever on a cache hit — invalidate and fall
+        # through so the engine actually re-runs ("re-run once" must work).
+        if cached and ((cached.get("words") and "f_start" not in cached["words"][0])
+                       or not cached.get("media_path")):
+            cached = None
         if cached:
             # Cache hit: re-resolve live positions (timeline may have
             # rippled since the transcribe) and re-stamp the duration, so
@@ -710,6 +951,16 @@ def get_transcript(search: str | None = None, limit: int = 200,
         words, missing = _words_with_live_times(rpc, t)
         present = [w for w in words if not w.get("removed")]
         sentences = _sentences(present)
+        extra: dict = {}
+        try:
+            bad = _trim_health(_all_existing_clips(rpc))
+        except BridgeError:
+            bad = []
+        if bad:
+            extra["trim_degenerate"] = bad
+            extra["trim_note"] = ("bridge reports trim_start_s=0 for every clip sharing "
+                                  "these files — t_start/t_end are best-effort and word "
+                                  "cuts are blocked until the bridge is fixed")
         if detail == "words":
             rows = present
             if search:
@@ -718,14 +969,14 @@ def get_transcript(search: str | None = None, limit: int = 200,
             rows = [{k: v for k, v in w.items() if v is not None}
                     for w in rows[: max(1, limit)]]
             return {"clip": t.get("clip"), "word_count": len(words),
-                    "removed_words": missing, "words": rows}
+                    "removed_words": missing, "words": rows, **extra}
         if search:
             s = search.lower()
             sentences = [x for x in sentences if s in x["text"].lower()]
         return {"clip": t.get("clip"), "word_count": len(words),
                 "removed_words": missing,
                 "sentence_count": len(sentences),
-                "sentences": sentences[: max(1, limit)]}
+                "sentences": sentences[: max(1, limit)], **extra}
 
     return logged("get_transcript", args, run)
 
@@ -739,13 +990,19 @@ def _word_ranges_to_spans(rpc, ranges: list) -> tuple:
         raise BridgeError("transcript predates file-relative times — re-run transcribe once")
     media = t.get("media_path")
     clips = _all_existing_clips(rpc)
+    if media in _trim_health(clips):
+        raise BridgeError(
+            "trim_start_s is 0 for every clip sharing "
+            f"{str(media)[:80]}… (bridge unclippedRange bug) — word spans would "
+            "be fiction. Fix the bridge (see docs/bridge.md), then retry."
+        )
     spans, texts, skipped = [], [], []
     for start_index, count in ranges:
         sel = cache_words[start_index: start_index + count]
         if len(sel) < count:
             raise BridgeError(f"only {len(cache_words) - start_index} words from index {start_index}")
         fa, fb = float(sel[0]["f_start"]), float(sel[-1]["f_end"])
-        frags = _resolve_file_interval(clips, media, fa, fb)
+        frags = _resolve_file_interval(clips, media, fa, fb, strict=True)
         if not frags:
             skipped.append({"start_index": start_index, "count": count,
                             "text": " ".join(w["w"] for w in sel),
@@ -759,15 +1016,19 @@ def _word_ranges_to_spans(rpc, ranges: list) -> tuple:
 
 @mcp.tool()
 def delete_words(start_index: int = 0, count: int = 0, dry_run: bool = True,
-                 ranges: list | None = None) -> dict:
+                 ranges: list | None = None, max_spans: int | None = None) -> dict:
     """Delete words [start_index, start_index+count) and ripple the video.
 
     Plan on sentences (get_transcript default): a sentence's start_word /
     end_word IS the range to pass here. For retake sweeps pass
     ranges=[[start, count], ...] — N file-stable ranges validated whole and
     cut right-to-left in one call (one re-resolve, one undo depth to revert).
+    For large sweeps pass max_spans=N (e.g. 20): cuts the rightmost N spans,
+    returns `pending` — re-call with the same ranges (file-stable, safe to
+    re-resolve) until `remaining` is 0. Sum each call's `undo_steps` to revert.
     """
-    args = {"start_index": start_index, "count": count, "dry_run": dry_run, "ranges": ranges}
+    args = {"start_index": start_index, "count": count, "dry_run": dry_run,
+            "ranges": ranges, "max_spans": max_spans}
 
     def run(rpc):
         batch = [tuple(r) for r in ranges] if ranges else [(start_index, count)]
@@ -785,7 +1046,10 @@ def delete_words(start_index: int = 0, count: int = 0, dry_run: bool = True,
                 out["span"] = spans[0]
                 out["text"] = texts[0] if texts else ""
             return out
-        report = _cut_spans(rpc, spans, "delete_words")
+        try:
+            report = _cut_spans(rpc, spans, "delete_words", max_spans)
+        except BridgeError as e:
+            return {"ok": False, "error": str(e)}
         report["texts"] = texts
         report["skipped"] = skipped
         return report
