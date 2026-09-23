@@ -86,7 +86,7 @@ base = [clip("c1", 0, 10), clip("c2", 10, 20)]
 seq = [state(30.0, base),   # before
        state(30.0, base), state(30.0, base),  # isolate [7,8]: pre + fresh
        state(22.0, base), state(22.0, base),  # isolate [4,5]: pre + fresh
-       state(21.0, base)]                    # after
+       state(21.0, base), state(21.0, base)]  # after + settle re-read
 rpc = FakeRpc(seq)
 rep = S._cut_spans(rpc, [(1.0, 2.0), (4.0, 5.0), (7.0, 8.0)], "t", max_spans=2)
 assert rep["removed"] == 2 and rep["remaining"] == 1, rep

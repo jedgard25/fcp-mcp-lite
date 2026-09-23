@@ -7,6 +7,7 @@ test:
 	$(VENV)/bin/python tests/test_cut_spans.py
 	$(VENV)/bin/python tests/test_safety.py
 	$(VENV)/bin/python tests/test_story.py
+	$(VENV)/bin/python tests/test_lineops.py
 
 mcp-setup:
 	python3 -m venv $(VENV)

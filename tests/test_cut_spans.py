@@ -45,10 +45,13 @@ rpc = FakeRpc([state(40.0, [clip("clip_1", 0, 10), clip("clip_2", 10, 20),
                              clip("clip_3", 30, 10)]),
                seg_state(),
                state(39.0, [clip("clip_1", 0, 10), clip("clip_2", 10, 15),
+                             clip("clip_4", 25, 4), clip("clip_5", 29, 10)]),
+               state(39.0, [clip("clip_1", 0, 10), clip("clip_2", 10, 15),
                              clip("clip_4", 25, 4), clip("clip_5", 29, 10)])])
 rep = _cut_spans(rpc, [(25.0, 26.0)], "t")
 selects = [c for c in rpc.calls if c[0] == "timeline.select"]
 assert rep["verify"] == "ok" and rep["removed"] == 1, rep
+assert rep["settled"] is True, rep
 assert rep["undo_steps"] == 3, rep  # 2 blades (mid-timeline) + 1 delete
 assert selects and selects[0][1] == {"id": "clip_2b"}, selects
 print("1 HIT ok | selected by ID:", selects[0][1], "| undo_steps:", rep["undo_steps"])
@@ -81,7 +84,7 @@ except BridgeError as e:
 # 4) duration mismatch -> MISMATCH names the revert, no lie
 rpc = FakeRpc([state(40.0, [clip("clip_1", 0, 10), clip("clip_2", 10, 20)]),
                state(40.0, [clip("clip_1", 0, 10), clip("clip_2", 10, 20)]),
-               seg_state(), seg_state()])
+               seg_state(), seg_state(), seg_state()])
 rep = _cut_spans(rpc, [(25.0, 26.0)], "t")
 assert rep["verify"].startswith("MISMATCH"), rep
 assert "undo(steps=3)" in rep["verify"], rep
@@ -116,6 +119,7 @@ def mclip(cid, t0, dur, trim=None, media="/tmp/x.mp4"):
 rpc = FakeRpc([state(30.0, [mclip("c1", 0, 10), mclip("c2", 10, 10), mclip("c3", 20, 10)]),
                state(30.0, [mclip("c1", 0, 10), mclip("c2", 10, 10), mclip("c3", 20, 10)]),
                state(30.0, [mclip("c1", 0, 10), mclip("c2", 10, 10), mclip("c3", 20, 10)]),
+               state(20.0, [mclip("c1", 0, 10), mclip("c3", 10, 10, trim=20)]),
                state(20.0, [mclip("c1", 0, 10), mclip("c3", 10, 10, trim=20)])])
 rep = _cut_spans(rpc, [(10.0, 20.0)], "t")
 blades = [c for c in rpc.calls if c == ("timeline.action", {"action": "blade"})]
@@ -156,8 +160,9 @@ S._last_transcript = lambda: {
 from server import _word_ranges_to_spans
 _after_real = [dict(c, media_path=_REAL_MEDIA) for c in _after]
 rpc = FakeRpc([state(20.0, _after_real)])
-spans, texts, skipped = _word_ranges_to_spans(rpc, [(0, 1), (1, 1), (2, 1)])
+spans, texts, skipped, refused = _word_ranges_to_spans(rpc, [(0, 1), (1, 1), (2, 1)])
 assert spans == [(1.0, 1.5), (11.0, 11.5)], spans
+assert not refused, refused
 assert skipped and skipped[0]["start_index"] == 1, skipped
 print("10 BATCH ok | spans:", spans, "| skipped:", len(skipped))
 

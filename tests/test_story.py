@@ -61,7 +61,8 @@ print("1 IDS ok |", [f["id"] for f in frags])
 # 2) take groups: near-dupes grouped, short "Okay." ignored
 groups = S._take_groups(frags)
 assert len(groups) == 1 and set(groups[0]["members"]) == {"L0000", "L0003"}, groups
-assert groups[0]["group"] == "G" + min(groups[0]["members"]), groups
+assert groups[0]["group"] == "G0000", groups  # file-anchored: stable across resolutions
+assert groups[0]["resolved"] is False, groups
 print("2 TAKES ok |", groups[0]["group"], groups[0]["members"])
 
 # 3) midpoint expansion: drop lands between words, not mid-phoneme
@@ -109,7 +110,7 @@ print("8 STABLE ok | ids unchanged after cut-away")
 many = [(float(i), float(i) + 1.0) for i in range(30)]
 base = [clip("c1", 0, 100), clip("c2", 0, 100)]
 seq = [state(100.0, base), state(100.0, base), state(100.0, base),
-       state(100.0 - 30 * 1.04, base)]
+       state(100.0 - 30 * 1.04, base), state(100.0 - 30 * 1.04, base)]
 rpc = FakeRpc(seq)
 rep = S._cut_spans(rpc, many[:1], "t")  # single-span sanity: tolerance path runs
 assert rep["verify"] == "ok" or rep["verify"].startswith("MISMATCH"), rep
