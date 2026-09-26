@@ -58,36 +58,33 @@ print("1 HIT ok | selected by ID:", selects[0][1], "| undo_steps:", rep["undo_st
 
 # 2) MISS: blades landed (1 -> 3 clips) but no segment covers mid ->
 #     both blades reverted, BridgeError
-rpc = FakeRpc([state(40.0, [clip("clip_1", 0, 10)]),
-               state(40.0, [clip("clip_1", 0, 10)]),
+rpc = FakeRpc([state(40.0, [clip("clip_1", 0, 10), clip("clip_2", 10, 30)]),
+               state(40.0, [clip("clip_1", 0, 10), clip("clip_2", 10, 30)]),
                state(40.0, [clip("clip_1", 0, 10), clip("clip_2", 10, 10),
                              clip("clip_3", 30, 10)])])
-try:
-    _cut_spans(rpc, [(25.0, 26.0)], "t")
-    raise SystemExit("2 MISS: NO ERROR (bad)")
-except BridgeError as e:
-    assert len(rpc.undos()) == 2, rpc.calls
-    print("2 MISS ok | undos:", len(rpc.undos()))
+rep = _cut_spans(rpc, [(25.0, 26.0)], "t")
+assert rep["ok"] is False and rep["failed"], rep
+assert len(rpc.undos()) == 2, rpc.calls
+print("2 MISS ok | undos:", len(rpc.undos()))
 
 # 3) select fails identity check -> issued blades reverted, nothing deleted
 rpc = FakeRpc([state(40.0, [clip("clip_1", 0, 10), clip("clip_2", 10, 20)]),
                state(40.0, [clip("clip_1", 0, 10), clip("clip_2", 10, 20)]),
                seg_state()], fail_select=True)
-try:
-    _cut_spans(rpc, [(25.0, 26.0)], "t")
-    raise SystemExit("3 SELECT-FAIL: NO ERROR (bad)")
-except BridgeError as e:
-    assert len(rpc.undos()) == 2, rpc.calls  # the 2 blades issued, nothing else
-    assert not [c for c in rpc.calls if c == ("timeline.action", {"action": "delete"})]
-    print("3 SELECT-FAIL ok | no delete issued, undos:", len(rpc.undos()))
+rep = _cut_spans(rpc, [(25.0, 26.0)], "t")
+assert rep["ok"] is False and rep["failed"], rep
+assert len(rpc.undos()) == 2, rpc.calls  # the 2 blades issued, nothing else
+assert not [c for c in rpc.calls if c == ("timeline.action", {"action": "delete"})]
+print("3 SELECT-FAIL ok | no delete issued, undos:", len(rpc.undos()))
 
 # 4) duration mismatch -> MISMATCH names the revert, no lie
 rpc = FakeRpc([state(40.0, [clip("clip_1", 0, 10), clip("clip_2", 10, 20)]),
                state(40.0, [clip("clip_1", 0, 10), clip("clip_2", 10, 20)]),
-               seg_state(), seg_state(), seg_state()])
+               seg_state()] + [seg_state()] * 5)
 rep = _cut_spans(rpc, [(25.0, 26.0)], "t")
-assert rep["verify"].startswith("MISMATCH"), rep
-assert "undo(steps=3)" in rep["verify"], rep
+assert rep["verify"].startswith("FAILED") and "expected=39.000s" in rep["verify"], rep
+assert rep["ok"] is False and rep["failed"]["span"] == [25.0, 26.0], rep
+assert rep["removed"] == 0 and rep["remaining"] == 1, rep
 print("4 MISMATCH ok |", rep["verify"][:70])
 
 # 5) stale ID resolution
@@ -126,6 +123,31 @@ blades = [c for c in rpc.calls if c == ("timeline.action", {"action": "blade"})]
 assert not blades and rep["undo_steps"] == 1, (rep, blades)
 assert rep["verify"] == "ok", rep
 print("7 BOUNDARY ok | no blades, undo_steps:", rep["undo_steps"])
+
+# 7b) A merged story drop crossing existing edits must become one cut per
+# primary clip. One midpoint selection cannot remove both clips.
+from server import _split_at_primary_edges
+assert _split_at_primary_edges([(10.0, 30.0)], [
+    dict(clip("c1", 0, 10), lane="primary"),
+    dict(clip("c2", 10, 10), lane="primary"),
+    dict(clip("c3", 20, 10), lane="primary")]) == [(20.0, 30.0), (10.0, 20.0)]
+print("7b SPLIT ok | merged drop covers two clip pieces")
+
+# A single 20s planned range crossing two clips must issue two deletes,
+# and each ripple is checked before the next piece is attempted.
+three = [dict(clip("c1", 0, 10), lane="primary"),
+         dict(clip("c2", 10, 10), lane="primary"),
+         dict(clip("c3", 20, 10), lane="primary")]
+two = three[:2]
+one = three[:1]
+rpc = FakeRpc([state(30.0, three),
+               state(30.0, three), state(30.0, three), state(20.0, two),
+               state(20.0, two), state(20.0, two), state(10.0, one)])
+rep = _cut_spans(rpc, [(10.0, 30.0)], "story")
+assert rep["verify"] == "ok" and rep["removed"] == 2, rep
+assert rep["actual_removed_s"] == rep["removed_s"] == 20.0, rep
+assert len([c for c in rpc.calls if c == ("timeline.action", {"action": "delete"})]) == 2
+print("7c CROSS-CLIP ok | two verified deletes")
 
 # 8) sentence chunking: punctuation split + word-range mapping
 from server import _sentences

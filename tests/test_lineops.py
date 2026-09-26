@@ -113,11 +113,9 @@ assert noop2 == ["G0000"] and per_group2["G0000"]["noop"] is True, (noop2, per_g
 assert keep_ids2 == ["L0000"], keep_ids2  # survivor only
 print("5 RESOLVED-NOOP ok")
 
-# 6) _normalize_choices shapes
+# 6) _normalize_choices accepts one typed shape
 assert S._normalize_choices({"G0000": "L0000"}) == [("G0000", "L0000")]
-assert S._normalize_choices([["G0000", "L0000"]]) == [("G0000", "L0000")]
-assert S._normalize_choices([{"group": "G0000", "keep": "L0000"}]) == [("G0000", "L0000")]
-for bad in ({}, [], [{"group": "G0000"}], [("G0000", "L0000"), ("G0000", "L0003")]):
+for bad in ({}, [], [{"group": "G0000"}], {"G0000": 3}):
     try:
         S._normalize_choices(bad)
         raise SystemExit(f"6 NORMALIZE: NO ERROR for {bad}")
@@ -169,5 +167,53 @@ assert w["warning"] and "min_duration_s=1.0" not in w["warning"] and "threshold_
 w2 = S._silence_warning([(0, 200.0)], duration_s=400.0, min_duration_s=0.5)
 assert "min_duration_s=1.0" in w2["warning"], w2
 print("12 WARNING ok")
+
+# 13) A long timeline read is bounded, pageable, and can inspect one window.
+orig_bridge_call, orig_record = S.bridge_call, S.record
+timeline_clips = [clip("a", 0.0, 10.0), clip("b", 10.0, 10.0),
+                  clip("c", 20.0, 10.0)]
+S.bridge_call = lambda method, params=None: state(30.0, timeline_clips)
+S.record = lambda *args, **kwargs: None
+try:
+    page = S.get_timeline(limit=2)
+    assert len(page["clips"]) == 2 and page["next_offset"] == 2, page
+    assert page["clip_count"] == 3 and page["matched_clip_count"] == 3, page
+    window = S.get_timeline(start_s=9.0, end_s=21.0, detail="full")
+    assert [c["id"] for c in window["clips"]] == ["a", "b", "c"], window
+    one = S.get_timeline(clip_id="b")
+    assert [c["id"] for c in one["clips"]] == ["b"] and one["next_offset"] is None, one
+finally:
+    S.bridge_call, S.record = orig_bridge_call, orig_record
+print("13 TIMELINE PAGE ok | bounded and filterable")
+
+# 14) split_words: dry_run places the blade in the word gap, commit verifies
+S._last_transcript = lambda: {"clip": "c", "media_path": REAL, "words": W,
+                              "timeline_duration_s": DUR}
+S.bridge_call = lambda method, params=None: state(DUR, CLIPS)
+S.record = lambda *args, **kwargs: None
+try:
+    dry = S.split_words(at_index=3)
+    assert dry.get("dry_run") and dry["at_t"] == 1.7, dry
+    assert dry["between"] == ["today.", "Hello"] and dry["gap_s"] == 0.2, dry
+    bad = S.split_words(at_index=0)
+    assert bad["ok"] is False and "splittable range" in bad["error"], bad
+    # commit: one clip becomes two, duration preserved
+    c1a = clip("c1a", 0.0, 1.7, trim=10.0)
+    c1b = clip("c1b", 1.7, DUR - 1.7, trim=11.7)
+    rpc = FakeRpc([state(DUR, CLIPS), state(DUR, CLIPS), state(DUR, [c1a, c1b])])
+    S.bridge_call = rpc
+    rep = S.split_words(at_index=3, dry_run=False)
+    assert rep["ok"] is True and rep["verify"] == "ok" and rep["undo_steps"] == 1, rep
+    kinds = [c[1]["action"] for c in rpc.actions()]
+    assert kinds == ["blade"], rpc.calls
+    # idempotent: same boundary now sits on an edit point — no second blade
+    rpc2 = FakeRpc([state(DUR, [c1a, c1b])])
+    S.bridge_call = rpc2
+    rep2 = S.split_words(at_index=3, dry_run=False)
+    assert rep2.get("already_split") is True and rep2["at_t"] == 1.7, rep2
+    assert rpc2.actions() == [], rpc2.calls
+finally:
+    S.bridge_call, S.record = orig_bridge_call, orig_record
+print("14 SPLIT ok | gap blade 1.7s, 1 undo, idempotent")
 
 print("ALL GREEN")

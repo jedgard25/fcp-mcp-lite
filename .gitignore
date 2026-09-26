@@ -1,6 +1,8 @@
 # build artifacts (rebuild with make / swift build)
 bridge/build/
 tools/parakeet-transcriber/.build/
+extensions/transcript-applet/.build/
+extensions/transcript-workflow/.build/
 __pycache__/
 *.pyc
 .DS_Store

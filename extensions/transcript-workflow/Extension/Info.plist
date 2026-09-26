@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <!-- Appears in FCP toolbar Extensions menu / Window > Extensions -->
+  <key>CFBundleDisplayName</key><string>Transcript</string>
+  <key>CFBundleIdentifier</key><string>local.fcp.transcript-panel.workflow</string>
+  <key>CFBundleName</key><string>TranscriptWorkflow</string>
+  <key>CFBundlePackageType</key><string>XPC!</string>
+  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>NSExtension</key><dict>
+    <key>NSExtensionPointIdentifier</key><string>com.apple.FinalCut.WorkflowExtension</string>
+    <key>ProExtensionPrincipalViewControllerClass</key><string>WorkflowExtensionViewController</string>
+  </dict>
+  <!-- Minimum FCP floating-window size for the card list -->
+  <key>ProExtensionAttributes</key><dict>
+    <key>ContentViewMinimumWidth</key><integer>300</integer>
+    <key>ContentViewMinimumHeight</key><integer>380</integer>
+  </dict>
+</dict></plist>

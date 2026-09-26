@@ -65,6 +65,15 @@ assert groups[0]["group"] == "G0000", groups  # file-anchored: stable across res
 assert groups[0]["resolved"] is False, groups
 print("2 TAKES ok |", groups[0]["group"], groups[0]["members"])
 
+# A sub-frame remnant of a rejected take must not keep its group open.
+crumb_frags = S._story_fragments(W)
+for f in crumb_frags:
+    f["t_start"], f["t_end"] = 1.0, 2.0
+crumb_frags[1]["t_end"] = 1.02
+g = S._take_groups(crumb_frags)[0]
+assert g["resolved"] and g["active"] == ["L0000"], g
+print("2b CRUMB GROUP ok | sub-frame take does not block review")
+
 # 3) midpoint expansion: drop lands between words, not mid-phoneme
 fa, fb = S._expand_to_midpoints(frags[1], {}, W)
 # prev word ends 11.8, first starts 11.8? check: w2 ends 10+2*0.6+0.4=11.6...
@@ -108,12 +117,113 @@ print("8 STABLE ok | ids unchanged after cut-away")
 
 # 9) scaled verify tolerance: 30 spans x 0.04 drift each must still verify
 many = [(float(i), float(i) + 1.0) for i in range(30)]
-base = [clip("c1", 0, 100), clip("c2", 0, 100)]
-seq = [state(100.0, base), state(100.0, base), state(100.0, base),
-       state(100.0 - 30 * 1.04, base), state(100.0 - 30 * 1.04, base)]
+base = [clip("c1", 0, 100)]
+split = [clip("c1a", 0, 1), clip("c1b", 1, 99)]
+short = [clip("c1b", 0, 68.8)]
+seq = [state(100.0, base), state(100.0, base), state(100.0, split)] + [state(68.8, short)] * 5
 rpc = FakeRpc(seq)
 rep = S._cut_spans(rpc, many[:1], "t")  # single-span sanity: tolerance path runs
-assert rep["verify"] == "ok" or rep["verify"].startswith("MISMATCH"), rep
+assert rep["verify"] == "ok" or rep["verify"].startswith("FAILED"), rep
 print("9 VERIFY ok | tol path:", str(rep.get("verify"))[:40])
+
+# 10) apply_story must not double-count cut undo entries.
+orig_cut, orig_settle = S._cut_spans, S._settle
+S._cut_spans = lambda *args: {"ok": True, "undo_steps": 3, "remaining": 0,
+                              "verify": "ok", "settled": True}
+S._settle = lambda *args, **kwargs: (10.0, True)
+try:
+    rep = S._execute_story_plan(FakeRpc([]), {
+        "spans": [(1.0, 2.0)], "moves": [], "will_remove": [], "crumbs": []
+    }, None, "apply_story")
+    assert rep["undo_steps"] == 3, rep
+finally:
+    S._cut_spans, S._settle = orig_cut, orig_settle
+print("10 UNDO ok | no double count")
+
+# 11) Failed drop verification must stop before the move phase.
+orig_cut = S._cut_spans
+S._cut_spans = lambda *args: {"ok": False, "undo_steps": 1, "remaining": 1,
+                              "failed": {"span": [1.0, 2.0]}, "verify": "FAILED"}
+try:
+    rep = S._execute_story_plan(FakeRpc([]), {
+        "spans": [(1.0, 2.0)], "moves": [{"id": "L0000", "after": "L0003"}],
+        "will_remove": [], "crumbs": []
+    }, None, "apply_story")
+    assert rep["ok"] is False and rep["moves_pending"], rep
+finally:
+    S._cut_spans = orig_cut
+print("11 STOP ok | failed drop never enters move phase")
+
+# 12) A post-cut sliver shorter than a frame is reported as a crumb,
+# not as a failed multi-second line drop.
+orig_cut, orig_settle, orig_live, orig_fresh = (
+    S._cut_spans, S._settle, S._story_live, S._fresh_transcript)
+S._cut_spans = lambda *args: {"ok": True, "undo_steps": 1, "remaining": 0,
+                              "removed": 1, "verify": "ok", "settled": True}
+S._settle = lambda *args, **kwargs: (9.0, True)
+S._fresh_transcript = lambda *args: {}
+S._story_live = lambda *args: ([{"id": "L0003", "text": "crumb",
+                                  "t_start": 1.0, "t_end": 1.02}], 0)
+try:
+    rep = S._execute_story_plan(FakeRpc([]), {
+        "spans": [(1.0, 2.0)], "moves": [],
+        "will_remove": [{"id": "L0003", "text": "crumb"}], "crumbs": []
+    }, None, "apply_story")
+    assert rep["ok"] and rep["story_verify"] == "ok_with_subframe_crumbs", rep
+    assert rep["unremoved"][0]["remaining_s"] == 0.02, rep
+finally:
+    S._cut_spans, S._settle, S._story_live, S._fresh_transcript = (
+        orig_cut, orig_settle, orig_live, orig_fresh)
+print("12 CRUMB ok | sub-frame remainder reported honestly")
+
+# 13) A remote 5ms source remnant must not stretch the movable line over
+# intervening footage (the L2403/L2409 move failure).
+move_words = [{"i": 0, "w": "Move", "f_start": 10.0, "f_end": 10.4},
+              {"i": 1, "w": "this.", "f_start": 10.5, "f_end": 12.0}]
+move_clips = [clip("main", 5.0, 2.0, trim=10.0),
+              clip("edge", 30.0, 0.005, trim=11.995)]
+live, _ = S._story_live(FakeRpc([state(32.0, move_clips)]),
+                        {"media_path": REAL, "words": move_words})
+assert live[0]["live_spans"] == [(5.0, 7.0), (30.0, 30.005)], live
+assert (live[0]["t_start"], live[0]["t_end"]) == (5.0, 7.0), live
+assert S._move_extent(live[0]) == (5.0, 7.0)
+print("13 MOVE EXTENT ok | remote sliver excluded")
+
+# 14) Compact story text follows live words after a word trim while IDs
+# and original text remain available for stable retake grouping.
+trim_words = [{"i": 0, "w": "Hello", "f_start": 0.0, "f_end": 0.4},
+              {"i": 1, "w": "um", "f_start": 0.6, "f_end": 1.0},
+              {"i": 2, "w": "world.", "f_start": 1.2, "f_end": 1.6}]
+trim_clips = [clip("a", 0.0, 0.5, trim=0.0),
+              clip("b", 0.5, 0.6, trim=1.1)]
+live, _ = S._story_live(FakeRpc([state(1.1, trim_clips)]),
+                        {"media_path": REAL, "words": trim_words})
+assert live[0]["id"] == "L0000" and live[0]["text"] == "Hello world.", live
+assert live[0]["_source_text"] == "Hello um world.", live
+print("14 LIVE TEXT ok | deleted word absent from story")
+
+# 15) An executed move with the wrong neighbor is reported as unfinished,
+# with the expected and actual positions attached.
+orig_live, orig_fresh, orig_settle, orig_move = (
+    S._story_live, S._fresh_transcript, S._settle, S._move_live_span)
+S._story_live = lambda *args: ([
+    {"id": "L0003", "text": "source", "t_start": 0.0, "t_end": 1.0},
+    {"id": "L0000", "text": "anchor", "t_start": 2.0, "t_end": 3.0}], 0)
+S._fresh_transcript = lambda *args: {}
+S._settle = lambda *args, **kwargs: (10.0, True)
+S._move_live_span = lambda *args: (3.0, 2)
+try:
+    rep = S._execute_story_plan(FakeRpc([]), {
+        "spans": [], "moves": [{"id": "L0003", "after": "L0000"}],
+        "keep": ["L0000", "L0003"], "will_remove": [], "crumbs": []
+    }, None, "move_line")
+    assert rep["ok"] is False and rep["moves"][0]["executed"] is True, rep
+    assert rep["moves"][0]["done"] is False, rep
+    assert rep["moves"][0]["position"]["expected_neighbor"] == "L0000", rep
+    assert rep["moves"][0]["position"]["actual_neighbor"] is None, rep
+finally:
+    S._story_live, S._fresh_transcript, S._settle, S._move_live_span = (
+        orig_live, orig_fresh, orig_settle, orig_move)
+print("15 MOVE VERIFY ok | executed is distinct from done")
 
 print("ALL GREEN")

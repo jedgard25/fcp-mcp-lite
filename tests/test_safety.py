@@ -80,17 +80,17 @@ print("7 SUBTRACT ok")
 
 # 8) chunking: max_spans cuts rightmost first, reports pending
 calls = []
-base = [clip("c1", 0, 10), clip("c2", 10, 20)]
-# fresh snapshot after each delete must reflect the compacted layout;
-# model 3 spans [1,2],[4,5],[7,8] cut rightmost-first with max_spans=2
-seq = [state(30.0, base),   # before
-       state(30.0, base), state(30.0, base),  # isolate [7,8]: pre + fresh
-       state(22.0, base), state(22.0, base),  # isolate [4,5]: pre + fresh
-       state(21.0, base), state(21.0, base)]  # after + settle re-read
+base = [clip("c1", 0, 10), clip("c2", 10, 10), clip("c3", 20, 10)]
+two = [clip("c1", 0, 10), clip("c2", 10, 10)]
+one = [clip("c1", 0, 10)]
+# Three whole-clip spans, two cuts in this chunk, each ripple verified.
+seq = [state(30.0, base),
+       state(30.0, base), state(30.0, base), state(20.0, two),
+       state(20.0, two), state(20.0, two), state(10.0, one)]
 rpc = FakeRpc(seq)
-rep = S._cut_spans(rpc, [(1.0, 2.0), (4.0, 5.0), (7.0, 8.0)], "t", max_spans=2)
+rep = S._cut_spans(rpc, [(0.0, 10.0), (10.0, 20.0), (20.0, 30.0)], "t", max_spans=2)
 assert rep["removed"] == 2 and rep["remaining"] == 1, rep
-assert rep["pending"] == [(1.0, 2.0)], rep
+assert rep["pending"] == [(0.0, 10.0)], rep
 print("8 CHUNK ok | removed 2, pending:", rep["pending"])
 
 # 9) stale-schema cache is a MISS, never a dead-end

@@ -42,7 +42,8 @@ REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # is talking to the latest checkout. (The injected dylib carries its own
 # FCB_VERSION in bridge/FCPBridge.m — the two versions are independent
 # and reported side-by-side.)
-__version__ = "0.5.0"
+__version__ = "0.5.4"
+DEFAULT_CUT_PIECES = 40
 # Transcript-cache schema. Bumped on any words/cache layout change; the key
 # AND the payload both carry it, so an upgrade never dead-ends on a stale
 # cache hit ("safe to reuse but not when our schema changes").
@@ -325,11 +326,13 @@ BLADE_EPS = 1 / 30  # within a frame of an edit point => no blade needed
 
 
 def _timeline_edit_points(rpc=None, clips: list | None = None) -> list:
-    """Sorted unique edit boundaries (timeline seconds)."""
+    """Sorted primary-storyline edit boundaries (timeline seconds)."""
     if clips is None:
         clips = _clips(rpc).get("clips", [])
     pts = set()
     for c in clips:
+        if c.get("lane") not in (None, "primary") or c.get("container"):
+            continue
         try:
             pts.add(round(float(c["timeline_start_s"]), 3))
             pts.add(round(float(c["timeline_start_s"]) + float(c["duration_s"]), 3))
@@ -372,12 +375,21 @@ def _isolate_span(rpc, a: float, b: float) -> tuple:
             rpc("timeline.undo")
 
     cands = [c for c in fresh.get("clips", [])
-             if c.get("id") and c["timeline_start_s"] <= mid
-             and c["timeline_start_s"] + c["duration_s"] >= mid]
-    if not cands:
+             if c.get("id") and c.get("lane") in (None, "primary")
+             and not c.get("container")
+             and c["timeline_start_s"] <= mid
+             < c["timeline_start_s"] + c["duration_s"]]
+    if len(cands) != 1:
         revert()
-        raise BridgeError(f"no clip found at {mid:.3f}s after blading [{a}, {b}] — reverted.")
-    seg = min(cands, key=lambda c: c["duration_s"])
+        raise BridgeError(f"expected one primary clip at {mid:.3f}s after blading "
+                          f"[{a}, {b}], found {len(cands)} — reverted")
+    seg = cands[0]
+    start = float(seg["timeline_start_s"])
+    end = start + float(seg["duration_s"])
+    if abs(start - a) > BLADE_EPS + 0.02 or abs(end - b) > BLADE_EPS + 0.02:
+        revert()
+        raise BridgeError(f"isolated clip [{start:.3f}, {end:.3f}] does not match "
+                          f"requested [{a:.3f}, {b:.3f}] — reverted")
     try:
         rpc("timeline.select", {"id": seg["id"]})
     except BridgeError as e:
@@ -411,19 +423,14 @@ def _settle(rpc, tries: int = 3, pause_s: float = 0.4) -> tuple:
 def _cut_spans(rpc, spans: list, label: str, max_spans: int | None = None) -> dict:
     """Delete each [a, b] (timeline seconds), right-to-left so offsets hold.
 
-    Per span: blade at both ends (skipped at existing edit points),
-    re-snapshot, select the fresh segment BY ID (identity, not playhead
-    luck), delete. A select miss reverts the blades — a wrong cut is
-    impossible by construction.
-    Returns report with the TRUE undo depth (blades actually issued +
-    deletes), so `undo(steps=report["undo_steps"])` restores one call.
+    Split merged ranges at primary clip edges first. Per clip piece: blade
+    at both ends (skipped at existing edit points), re-snapshot, select by
+    ID, delete, and verify that the primary duration shrank by that piece.
+    Stops on the first failed piece with its coordinates in `failed`.
 
-    max_spans (chunking): cut only the RIGHTMOST `max_spans` spans and
-    report the rest as `pending` (still valid timeline seconds — cutting
-    right-to-left never shifts earlier spans, and file-anchored planners
-    re-resolve anyway). Loop until `remaining` is 0. This keeps each call
-    under the MCP client timeout: ~0.8s/span means 169 spans ≈ 140s in one
-    call (server finishes, session drops), but 20 spans ≈ 16s per call.
+    max_spans caps clip pieces, not original merged ranges. Defaults to 40
+    to keep calls under the MCP client timeout. Pending pieces remain valid
+    because cuts run right-to-left; file-anchored planners also re-resolve.
     """
     spans = _merge_spans([(float(a), float(b)) for a, b in spans])
     tiny = [(a, b) for a, b in spans if b - a < SILENCE_FRAME]
@@ -439,57 +446,131 @@ def _cut_spans(rpc, spans: list, label: str, max_spans: int | None = None) -> di
     spans = [(a, b) for a, b in spans if b > a]
     if not spans:
         return {"removed": 0, "removed_s": 0.0, "undo_steps": 0}
-    desc = sorted(spans, reverse=True)
-    pending: list = []
-    if max_spans is not None and len(desc) > max_spans:
-        desc, pending = desc[:max_spans], desc[max_spans:]
+    if max_spans is not None and max_spans < 1:
+        raise BridgeError("max_spans must be >= 1")
     with _WRITE_LOCK:
-        report = _cut_spans_locked(rpc, desc, label)
-    if pending:
-        report["remaining"] = len(pending)
-        report["pending"] = pending  # rightmost-first order; cut these next
-        report["note"] = (f"chunked: cut {report['removed']}, {len(pending)} pending — "
-                          "re-call with the same args until remaining is 0")
-    else:
-        report["remaining"] = 0
-    return report
+        return _cut_spans_locked(rpc, spans, label, max_spans)
 
 
-def _cut_spans_locked(rpc, desc: list, label: str) -> dict:
+def _split_at_primary_edges(spans: list, clips: list) -> list:
+    """Turn each merged range into pieces that each belong to one primary clip."""
+    primary = [c for c in clips if c.get("lane") in (None, "primary")
+               and c.get("id") and not c.get("container")]
+    pieces = []
+    for a, b in spans:
+        edges = {a, b}
+        for c in primary:
+            # Planner spans are millisecond-rounded. Use the same grid for
+            # edit points or a 0.3ms FCP edge creates a phantom zero piece.
+            start = round(float(c["timeline_start_s"]), 3)
+            end = round(float(c["timeline_start_s"]) + float(c["duration_s"]), 3)
+            if a < start < b:
+                edges.add(start)
+            if a < end < b:
+                edges.add(end)
+        ordered = sorted(edges)
+        for lo, hi in zip(ordered, ordered[1:]):
+            if hi - lo < SILENCE_FRAME:
+                # FCP often reports adjacent edges 1ms apart after frame
+                # rounding. A sub-frame piece cannot be bladed safely.
+                continue
+            mid = (lo + hi) / 2
+            owners = [c for c in primary if float(c["timeline_start_s"]) <= mid
+                      < float(c["timeline_start_s"]) + float(c["duration_s"])]
+            if len(owners) != 1:
+                raise BridgeError(f"span [{lo:.3f}, {hi:.3f}] has {len(owners)} "
+                                  "primary owners — refusing ambiguous cut")
+            pieces.append((round(lo, 3), round(hi, 3)))
+    return sorted(pieces, reverse=True)
+
+
+def _await_cut_duration(rpc, expected: float, tolerance: float = 0.2) -> tuple:
+    """Wait for one ripple; unchanged early snapshots are not settled evidence."""
+    actual = 0.0
+    for attempt in range(5):
+        if attempt:
+            time.sleep(0.3)
+        actual = float(_clips(rpc).get("duration_s", 0))
+        if abs(actual - expected) <= tolerance:
+            return actual, True
+    return actual, False
+
+
+def _cut_spans_locked(rpc, spans: list, label: str,
+                      max_spans: int | None = None) -> dict:
     """Execute pre-validated spans right-to-left. Caller holds _WRITE_LOCK."""
     _ = label  # executor name, kept for log readability
     before = _clips(rpc)
     dur_before = before.get("duration_s", 0)
     total = dur_before
-    for a, b in desc:
+    for a, b in spans:
         if not (0 <= a < b <= total + 0.05):
             raise BridgeError(f"span [{a}, {b}] outside timeline (0, {total:.3f}) — re-plan")
+    desc = _split_at_primary_edges(spans, before.get("clips", []))
+    if not desc:
+        raise BridgeError("no frame-sized primary clip pieces in planned spans")
+    limit = max_spans if max_spans is not None else DEFAULT_CUT_PIECES
+    pending = desc[limit:]
+    desc = desc[:limit]
     removed_s = 0.0
-    steps = 0
     undos = 0
+    applied = []
+    failure = None
+    actual = float(dur_before)
     for a, b in desc:
-        _, blades = _isolate_span(rpc, a, b)
-        rpc("timeline.action", {"action": "delete"})
-        removed_s += b - a
-        steps += 1
+        try:
+            _, blades = _isolate_span(rpc, a, b)
+        except BridgeError as e:
+            failure = {"span": [a, b], "reason": str(e)}
+            break
+        try:
+            rpc("timeline.action", {"action": "delete"})
+        except BridgeError as e:
+            for _ in range(blades):
+                rpc("timeline.undo")
+            failure = {"span": [a, b], "reason": f"delete rejected: {e}; blades reverted"}
+            break
         undos += blades + 1
-    # Settle before verify: FCP ripples async, and a premature read
-    # presents as a MISMATCH (2026-09-23 postmortem item 2/10).
-    dur_after, settled = _settle(rpc)
-    expected = dur_before - removed_s
-    # Frame-snap scales with span count: each blade lands on a frame
-    # boundary, so a fixed 4-frame window false-MISMATCHes on big sweeps.
-    tol = 0.15 + 0.05 * steps
-    ok = abs(dur_after - expected) < tol
+        expected_step = actual - (b - a)
+        try:
+            observed, done = _await_cut_duration(rpc, expected_step)
+        except BridgeError as e:
+            failure = {"span": [a, b], "reason": f"cannot verify delete: {e}"}
+            break
+        if not done:
+            failure = {"span": [a, b], "expected_duration_s": round(expected_step, 3),
+                       "actual_duration_s": round(observed, 3),
+                       "reason": "delete did not ripple by the requested span"}
+            actual = observed
+            break
+        actual = observed
+        removed_s += b - a
+        applied.append([a, b])
+    remaining = ([failure["span"]] if failure else []) + desc[len(applied) + (1 if failure else 0):] + pending
+    dur_after = actual
+    expected = (failure.get("expected_duration_s", dur_before - removed_s)
+                if failure else dur_before - removed_s)
+    ok = failure is None
     report = {
-        "removed": steps,
+        "ok": ok,
+        "removed": len(applied),
         "removed_s": round(removed_s, 3),
+        "actual_removed_s": round(dur_before - dur_after, 3),
         "duration_before_s": round(dur_before, 3),
         "duration_after_s": round(dur_after, 3),
         "undo_steps": undos,
-        "settled": settled,
-        "verify": "ok" if ok else f"MISMATCH expected={expected:.3f}s actual={dur_after:.3f}s — undo(steps={undos}) to revert",
+        "settled": ok,
+        "verify": "ok" if ok else f"FAILED expected={expected:.3f}s actual={dur_after:.3f}s: {failure['reason']}",
+        "remaining": len(remaining),
     }
+    if remaining:
+        report["pending"] = remaining
+    if failure:
+        report["failed"] = failure
+        report["note"] = "stopped after the first failed ripple; inspect before retrying"
+    elif pending:
+        report["note"] = (f"chunked: cut {len(applied)} clip pieces, {len(pending)} pending — "
+                          "re-call with the same args until remaining is 0")
     return report
 
 
@@ -528,9 +609,48 @@ def bridge_status() -> dict:
 
 
 @mcp.tool()
-def get_timeline() -> dict:
-    """Timeline clips: name, lane, timeline span, trim offset, source file path."""
-    return logged("get_timeline", {}, _clips)
+def get_timeline(start_s: float | None = None, end_s: float | None = None,
+                 clip_id: str | None = None, offset: int = 0,
+                 limit: int = 50, detail: str = "compact") -> dict:
+    """Read a bounded timeline window or one clip by ID.
+
+    Compact clips include ID, lane, timeline position, duration and source
+    trim. Use start_s/end_s for a region, clip_id for one clip, or page with
+    next_offset. detail='full' adds raw bridge fields for the selected page.
+    """
+    args = {"start_s": start_s, "end_s": end_s, "clip_id": clip_id,
+            "offset": offset, "limit": limit, "detail": detail}
+
+    def run(rpc):
+        if detail not in ("compact", "full"):
+            return {"ok": False, "error": "detail must be compact or full"}
+        if limit < 1 or offset < 0:
+            return {"ok": False, "error": "limit must be >= 1 and offset >= 0"}
+        if start_s is not None and end_s is not None and start_s >= end_s:
+            return {"ok": False, "error": "start_s must be before end_s"}
+        state = _clips(rpc)
+        all_clips = state.get("clips", [])
+        rows = all_clips
+        if clip_id is not None:
+            rows = [c for c in rows if c.get("id") == clip_id]
+        if start_s is not None:
+            rows = [c for c in rows if c.get("timeline_start_s", 0)
+                    + c.get("duration_s", 0) > start_s]
+        if end_s is not None:
+            rows = [c for c in rows if c.get("timeline_start_s", 0) < end_s]
+        count = len(rows)
+        page = rows[offset:offset + min(limit, 100)]
+        if detail == "compact":
+            keys = ("id", "name", "lane", "class", "timeline_start_s",
+                    "duration_s", "trim_start_s", "parent")
+            page = [{k: c[k] for k in keys if k in c} for c in page]
+        return {"sequence_name": state.get("sequence_name"),
+                "duration_s": state.get("duration_s"), "fps": state.get("fps"),
+                "clip_count": len(all_clips), "matched_clip_count": count,
+                "clips": page,
+                "next_offset": offset + len(page) if offset + len(page) < count else None}
+
+    return logged("get_timeline", args, run)
 
 
 @mcp.tool()
@@ -542,6 +662,95 @@ def get_playhead() -> dict:
 # ---------------------------------------------------------------- silences
 
 SILENCE_FRAME = 1 / 30  # sub-frame slivers are uncuttable; drop them
+
+# Kept islands at/below this shape that sit between two cut spans are
+# breathing / false-start slop, not content: zero transcribed words
+# (breath, mouth noise the detector scored above threshold) or a couple
+# of filler/low-confidence words ("Okay so", "uh", retry stutter).
+FILLER_WORDS = frozenset({
+    "okay", "ok", "so", "um", "uh", "uh-huh", "yeah", "yep", "like",
+    "you", "know", "well", "right", "hmm", "hm", "oh", "ah", "er",
+    "and", "but", "so-", "i", "i-", "let", "lets", "let's",
+})
+
+
+def _collapse_silence_islands(spans: list, rpc, max_island_s: float) -> tuple:
+    """Merge cut spans across tiny kept islands (breath / false-start slop).
+
+    `spans` are merged timeline-second cut spans. An interior gap
+    [prev_end, next_start] with duration <= max_island_s is absorbed (the
+    two spans merged) when the gap holds no real speech: zero transcribed
+    words, or only a few filler/low-confidence words. Returns
+    (spans, collapsed_count, details).
+    """
+    if not spans or len(spans) < 2 or max_island_s <= 0:
+        return spans, 0, []
+    try:
+        t = _last_transcript()
+    except Exception:
+        t = None
+    words = (t.get("words", []) if t else []) or []
+    atom = []
+    for w in words:
+        try:
+            atom.append((float(w["f_start"]), float(w["f_end"]),
+                         str(w.get("w", "")).strip().strip(",.?!…'\"").lower(),
+                         float(w.get("confidence", 1.0) or 0.0)))
+        except (KeyError, TypeError, ValueError):
+            continue
+    try:
+        clips = _all_existing_clips(rpc)
+    except BridgeError:
+        return spans, 0, []
+    by_start = {round(a, 3): round(b, 3) for a, b in spans}
+    ordered = sorted((round(a, 3), round(b, 3)) for a, b in spans)
+    out = [list(ordered[0])]
+    collapsed, details = 0, []
+    for next_a, next_b in ordered[1:]:
+        cur_b = out[-1][1]
+        gap = round(next_a - cur_b, 3)
+        if gap <= 0:
+            out[-1][1] = max(cur_b, next_b)
+            continue
+        if gap > max_island_s:
+            out.append([next_a, next_b])
+            continue
+        # Map the kept gap back to file intervals and collect words inside.
+        gap_words = []
+        for c in clips:
+            try:
+                tb = float(c["timeline_start_s"])
+                dur = float(c["duration_s"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            lo, hi = max(cur_b, tb), min(next_a, tb + dur)
+            if hi <= lo:
+                continue
+            f0, _ = _clip_file_window(c)
+            fa, fb = f0 + (lo - tb), f0 + (hi - tb)
+            for fs, fe, wl, conf in atom:
+                if fe > fa and fs < fb and (wl, conf) not in gap_words:
+                    gap_words.append((wl, conf))
+        if not gap_words:
+            reason = "no transcribed words (breath/noise)"
+            absorb = True
+        elif (len(gap_words) <= 4
+                and all(w in FILLER_WORDS or cf < 0.7 for w, cf in gap_words)):
+            reason = f"false-start filler ({' '.join(w for w, _ in gap_words)[:60]})"
+            absorb = True
+        else:
+            absorb = False
+        if absorb:
+            out[-1][1] = next_b
+            collapsed += 1
+            details.append({"gap_start": cur_b, "gap_end": next_a,
+                            "gap_s": gap,
+                            "words": [w for w, _ in gap_words],
+                            "reason": reason})
+        else:
+            out.append([next_a, next_b])
+    merged = _merge_spans([(a, b) for a, b in out])
+    return merged, collapsed, details
 
 
 def _word_guard_intervals(media_path: str, margin_s: float) -> list:
@@ -723,22 +932,28 @@ def remove_silences(
     dry_run: bool = True,
     max_spans: int | None = None,
     word_guard_s: float = 0.3,
+    collapse_islands: bool = True,
+    max_island_s: float = 1.5,
 ) -> dict:
     """Cut every silence (pad kept each side so speech breathes).
 
     dry_run=True (default) returns the cut list without writing. Speech from
     the cached transcript (expanded by word_guard_s) is subtracted from each
     silence before cutting, so a hot threshold can't eat word onsets.
-    For large cut lists pass max_spans=N (e.g. 20): cuts the rightmost N,
-    returns `pending` — re-call with the same args (file-anchored spans
-    re-resolve, so chunking is safe) until `remaining` is 0. Sum each call's
-    `undo_steps` for a full revert. Each chunk is logged: `make logs` shows
-    progress live.
+    When collapse_islands is true (default), tiny kept islands between two
+    silences (<= max_island_s, holding no real speech: breath/noise or a
+    filler false-start like "Okay so" / "uh") are absorbed into the cut, so
+    `[speech] [breath] [Okay so][retry] [speech]` becomes `[speech][speech]`
+    instead of leaving 0.5s breathing slivers behind.
+    Cuts at most 40 primary clip pieces per call by default; max_spans
+    overrides this cap. Re-call with the same args (file-anchored spans
+    re-resolve) until `remaining` is 0. Each chunk is logged.
     """
 
     args = {"threshold_db": threshold_db, "min_duration_s": min_duration_s,
             "pad_s": pad_s, "dry_run": dry_run, "max_spans": max_spans,
-            "word_guard_s": word_guard_s}
+            "word_guard_s": word_guard_s, "collapse_islands": collapse_islands,
+            "max_island_s": max_island_s}
 
     def run(rpc):
         try:
@@ -746,14 +961,27 @@ def remove_silences(
                                             pad_s, word_guard_s)
         except BridgeError as e:
             return {"ok": False, "error": str(e)}
+        islands_collapsed, island_details = 0, []
+        if collapse_islands and spans:
+            spans, islands_collapsed, island_details = _collapse_silence_islands(
+                spans, rpc, max_island_s)
         warn = _silence_warning(spans, rpc, min_duration_s=min_duration_s)
         if dry_run or not spans:
-            return {"dry_run": dry_run, "files": per_file, "spans": spans, **warn}
+            out = {"dry_run": dry_run, "files": per_file, "spans": spans, **warn}
+            if collapse_islands:
+                out["islands_collapsed"] = islands_collapsed
+                if island_details:
+                    out["island_details"] = island_details[:20]
+            return out
         try:
             report = _cut_spans(rpc, spans, "remove_silences", max_spans)
         except BridgeError as e:
             return {"ok": False, "error": str(e)}
         report["files"] = per_file
+        if collapse_islands:
+            report["islands_collapsed"] = islands_collapsed
+            if island_details:
+                report["island_details"] = island_details[:20]
         if warn["warning"]:
             report["warning"] = warn["warning"]
         return report
@@ -762,13 +990,13 @@ def remove_silences(
 
 
 @mcp.tool()
-def cut_spans(spans: list, dry_run: bool = True, max_spans: int | None = None) -> dict:
+def cut_spans(spans: list[list[float]], dry_run: bool = True,
+              max_spans: int | None = None) -> dict:
     """Cut explicit timeline-second spans [[a, b], ...], right-to-left.
 
-    The chunk executor: validate whole, cut at most `max_spans` (rightmost
-    first), report `pending` for the next call. Loop until `remaining` is 0,
-    then sum each call's `undo_steps` for a full revert. Every call is
-    logged, so `make logs` shows progress live.
+    The chunk executor: validate whole, split at primary clip edges, cut
+    at most `max_spans` pieces (40 by default, rightmost first), and
+    report `pending` for the next call. Stops on a failed ripple.
     """
     args = {"spans": spans, "dry_run": dry_run, "max_spans": max_spans}
 
@@ -790,13 +1018,13 @@ def cut_spans(spans: list, dry_run: bool = True, max_spans: int | None = None) -
 
 
 @mcp.tool()
-def apply_cut_list(keep_ranges: list, dry_run: bool = True,
+def apply_cut_list(keep_ranges: list[list[float]], dry_run: bool = True,
                    max_spans: int | None = None) -> dict:
     """Rough cut in one verb: keep [[start_s, end_s]...], drop the rest, close gaps.
 
     Ranges validated whole (sorted, non-overlapping, inside the timeline) before
     any write. Cuts run right-to-left so offsets hold; duration verified after.
-    For large drops pass max_spans=N (e.g. 20): cuts the rightmost N drops,
+    For large drops pass max_spans=N: cuts the rightmost N primary clip pieces,
     returns `pending` — finish with cut_spans(pending) (same spans stay valid
     because right-to-left cuts never shift earlier positions), looping until
     `remaining` is 0. Sum each call's `undo_steps` for a full revert.
@@ -920,6 +1148,12 @@ def _norm_text(t: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", t.lower())).strip()
 
 
+def _story_crumb(f: dict) -> bool:
+    """A surviving line too short to cut safely or count as a live take."""
+    return (not f.get("removed") and f.get("t_start", -1) >= 0
+            and 0 <= f.get("t_end", -1) - f["t_start"] < SILENCE_FRAME)
+
+
 def _take_groups(frags: list, window: int = 10, ratio: float = 0.6) -> list:
     """Group near-duplicate fragments (retakes) within a sliding window.
 
@@ -943,7 +1177,9 @@ def _take_groups(frags: list, window: int = 10, ratio: float = 0.6) -> list:
         if ra != rb:
             parent[max(ra, rb)] = min(ra, rb)
 
-    norms = [_norm_text(f["text"]) for f in frags]
+    # Retake identities must stay tied to the original transcription even
+    # when a later word trim changes the text shown to the editor.
+    norms = [_norm_text(f.get("_source_text", f["text"])) for f in frags]
     for i in range(n):
         if len(norms[i]) < 12:
             continue  # too short to fuzzy-match meaningfully
@@ -959,7 +1195,8 @@ def _take_groups(frags: list, window: int = 10, ratio: float = 0.6) -> list:
     for members in buckets.values():
         if len(members) >= 2:
             ids = [frags[k]["id"] for k in members]
-            active = [frags[k]["id"] for k in members if not frags[k].get("removed")]
+            active = [frags[k]["id"] for k in members
+                      if not frags[k].get("removed") and not _story_crumb(frags[k])]
             gid = f"G{min(frags[k]['start_word'] for k in members):04d}"
             groups.append({"group": gid, "members": ids, "active": active,
                            "resolved": len(active) <= 1,
@@ -982,14 +1219,35 @@ def _story_live(rpc, t: dict) -> tuple:
         raise BridgeError("transcript has no media_path — re-run transcribe")
     clips = _all_existing_clips(rpc)
     frags = _story_fragments(cache_words)
+    words_by_index = {w["i"]: w for w in cache_words}
     missing = 0
     for f in frags:
+        f["_source_text"] = f["text"]
         hits = _resolve_file_interval(clips, media, f["f_start"], f["f_end"])
         if not hits:
             missing += 1
             f["t_start"], f["t_end"], f["removed"] = -1, -1, True
         else:
-            f["t_start"], f["t_end"] = hits[0][0], hits[-1][1]
+            substantial = [(a, b) for a, b in hits if b - a >= SILENCE_FRAME]
+            # A few milliseconds of a source line can survive a blade far
+            # away from its main clip. Never let that sliver stretch its
+            # apparent timeline extent across unrelated footage.
+            core = substantial[0] if len(substantial) == 1 else None
+            f["t_start"], f["t_end"] = core if core else (hits[0][0], hits[-1][1])
+            if len(hits) > 1:
+                f["live_spans"] = hits
+            if len(substantial) > 1:
+                f["discontinuous"] = True
+            visible = []
+            for i in range(f["start_word"], f["end_word"] + 1):
+                w = words_by_index.get(i)
+                if w is None:
+                    continue
+                word_hits = _resolve_file_interval(clips, media, w["f_start"], w["f_end"])
+                if sum(b - a for a, b in word_hits) >= SILENCE_FRAME:
+                    visible.append(w["w"])
+            if visible:
+                f["text"] = " ".join(visible)
     # Groups computed over ALL frags (removed included) so ids are stable
     # across resolutions; removed members keep their group for history.
     for g in _take_groups(frags):
@@ -1103,15 +1361,27 @@ def _story_plan(rpc, keep_ids: list) -> dict:
                "dur_s": round(f["t_end"] - f["t_start"], 3)}
               for f in frags if f["id"] in keep_set
               and not f.get("removed") and (f["t_end"] - f["t_start"]) < CRUMB_WARN_S]
-    dur = _clips(rpc).get("duration_s", 0)
-    remove_s = round(sum(b - a for a, b in spans), 3)
+    state = _clips(rpc)
+    dur = state.get("duration_s", 0)
+    try:
+        pieces = _split_at_primary_edges(spans, state.get("clips", []))
+    except BridgeError as e:
+        return {"ok": False, "error": str(e)}
+    if spans and not pieces:
+        return {"ok": False, "error": "planned drops contain no frame-sized primary clip pieces"}
+    edge_slivers_s = round(sum(b - a for a, b in spans) - sum(b - a for a, b in pieces), 3)
+    remove_s = round(sum(b - a for a, b in pieces), 3)
     out = {"ok": True, "keep": keep_ids, "kept": len(keep_ids),
            "will_remove": [{"id": f["id"], "text": f["text"]} for f in drop_frags
                            if f["id"] not in {u["id"] for u in unremoved}],
            "drops": len(drop_frags) - len(unremoved), "spans": spans,
+           "clip_pieces": len(pieces),
+           "expected_calls": (len(pieces) + DEFAULT_CUT_PIECES - 1) // DEFAULT_CUT_PIECES,
+           "edge_slivers_s": edge_slivers_s,
            "would_remove_s": remove_s,
            "duration_before_s": round(dur, 3),
            "duration_after_s": round(dur - remove_s, 3),
+           "duration_prediction": "estimate; commit checks live ripple per clip piece",
            "moves": moves, "crumbs": crumbs}
     if unremoved:
         out["unremoved"] = unremoved
@@ -1122,15 +1392,53 @@ def dupe_str(dupes: list) -> str:
     return ", ".join(dupes[:8])
 
 
-def _move_live_span(rpc, span: tuple, dest_t: float) -> float:
-    """Cut one live span and paste at dest_t (anchor re-resolved by caller)."""
+def _move_live_span(rpc, span: tuple, dest_t: float) -> tuple:
+    """Cut one live span and paste at dest_t; return (destination, undo entries)."""
     span_len = span[1] - span[0]
-    _isolate_span(rpc, span[0], span[1])
+    _, blades = _isolate_span(rpc, span[0], span[1])
     rpc("timeline.action", {"action": "cut"})
     dest_adj = dest_t - span_len if dest_t > span[1] else dest_t
     rpc("playback.seek", {"t_s": max(0, dest_adj)})
     rpc("timeline.action", {"action": "paste"})
-    return dest_adj
+    return dest_adj, blades + 2
+
+
+def _move_extent(frag: dict) -> tuple:
+    """One movable line interval, excluding sub-frame source remnants."""
+    spans = frag.get("live_spans") or [(frag["t_start"], frag["t_end"])]
+    core = [(a, b) for a, b in spans if b - a >= SILENCE_FRAME]
+    if len(core) != 1:
+        raise BridgeError(f"{frag['id']} has {len(core)} frame-sized live spans "
+                          f"{[[round(a, 3), round(b, 3)] for a, b in core]} — "
+                          "move_line needs one contiguous span")
+    return core[0]
+
+
+def _move_order_check(rpc, move: dict) -> dict:
+    """Explain the moved line's actual neighbor and live clip bounds."""
+    frags, _ = _story_live(rpc, _fresh_transcript(rpc))
+    active = [f for f in frags if not f.get("removed") and not _story_crumb(f)]
+    order = [f["id"] for f in sorted(active, key=lambda f: f["t_start"])]
+    by_id = {f["id"]: f for f in active}
+    src = move["id"]
+    anchor = move.get("after") or move.get("before")
+    if src not in by_id or anchor not in by_id:
+        return {"verified": False, "reason": "source or anchor absent after move",
+                "source": src, "anchor": anchor}
+    index = order.index(src)
+    after = "after" in move
+    neighbor = (order[index - 1] if index else None) if after else (
+        order[index + 1] if index + 1 < len(order) else None)
+    try:
+        source_span = _move_extent(by_id[src])
+        anchor_span = _move_extent(by_id[anchor])
+    except BridgeError as e:
+        return {"verified": False, "reason": str(e),
+                "expected_neighbor": anchor, "actual_neighbor": neighbor}
+    return {"verified": neighbor == anchor,
+            "expected_neighbor": anchor, "actual_neighbor": neighbor,
+            "source_span": [round(x, 3) for x in source_span],
+            "anchor_span": [round(x, 3) for x in anchor_span]}
 
 
 def _load_cache(key: str) -> dict | None:
@@ -1295,7 +1603,12 @@ def get_transcript(search: str | None = None, limit: int = 200,
 def _word_ranges_to_spans(rpc, ranges: list) -> tuple:
     """Resolve [[start_index, count], ...] (stable FILE indices) to merged
     timeline spans via live clip layout.
-    Returns (spans, texts, skipped, refused). Sub-frame ranges land in
+    Returns (spans, texts, skipped, refused). Blades land EXACTLY on the
+    cached word edges (no padding, no midpoint expansion): Parakeet edges
+    carry ~0.2-0.5s error, so intra-sentence ranges can blade mid-phoneme.
+    Prefer delete_lines (midpoint-expanded, blades land in silence) for
+    anything expressible as whole story lines; reserve this primitive for
+    sub-line sweeps. Sub-frame ranges land in
     `refused` — executing them would blade-select the whole host clip
     (2026-09-23: 1ms span removed 6.2s). Refused crumbs are inaudible:
     leave them, or delete their line via delete_lines (midpoint-safe).
@@ -1339,19 +1652,71 @@ def _word_ranges_to_spans(rpc, ranges: list) -> tuple:
     return _merge_spans(spans), texts, skipped, refused
 
 
+def _word_range_edge_notes(rpc, batch: list) -> list:
+    """Flag word ranges that split a transcribed sentence mid-speech.
+
+    A range whose file edge sits <1.0s from a neighboring cached word will
+    blade inside continuous speech (exact-edge blades, no padding). Purely
+    advisory — geometry is unchanged — so agents catch the
+    "ok so I- / -really" mistake at dry_run time and reach for
+    delete_lines instead.
+    """
+    try:
+        t = _fresh_transcript(rpc)
+    except BridgeError:
+        return []
+    cw = t.get("words", []) or []
+    notes = []
+    for si, co in batch:
+        try:
+            si, co = int(si), int(co)
+        except (TypeError, ValueError):
+            continue
+        if si < 0 or co <= 0 or si + co > len(cw):
+            continue
+        edge = []
+        if si > 0:
+            try:
+                gap = float(cw[si]["f_start"]) - float(cw[si - 1]["f_end"])
+                if gap < 1.0:
+                    edge.append(
+                        f"starts mid-sentence (prev word "
+                        f"'{cw[si - 1].get('w', '')}' {gap:.2f}s before — "
+                        f"blade lands mid-speech; prefer delete_lines)")
+            except (KeyError, TypeError, ValueError):
+                pass
+        if si + co < len(cw):
+            try:
+                gap = float(cw[si + co]["f_start"]) - float(cw[si + co - 1]["f_end"])
+                if gap < 1.0:
+                    edge.append(
+                        f"ends mid-sentence (next word "
+                        f"'{cw[si + co].get('w', '')}' {gap:.2f}s after — "
+                        f"blade lands mid-speech; prefer delete_lines)")
+            except (KeyError, TypeError, ValueError):
+                pass
+        if edge:
+            notes.append({"start_index": si, "count": co, "warnings": edge})
+    return notes
+
+
 @mcp.tool()
 def delete_words(start_index: int = 0, count: int = 0, dry_run: bool = True,
-                 ranges: list | None = None, max_spans: int | None = None) -> dict:
+                 ranges: list[list[int]] | None = None,
+                 max_spans: int | None = None) -> dict:
     """Delete words [start_index, start_index+count) and ripple the video.
 
     LOW-LEVEL range primitive — prefer delete_lines with story ids (see
     get_story): no index math, midpoint-safe drops, crumbs handled. Use
     this only for sub-line sweeps the story layer can't express.
+    Blades land EXACTLY on cached word edges (no padding): ranges that
+    start/end mid-sentence are flagged in `edge_warnings` — eye-check them,
+    or use delete_lines so blades land in silence.
     For retake sweeps pass ranges=[[start, count], ...] — N file-stable
     ranges validated whole and cut right-to-left in one call (one
     re-resolve, one undo depth to revert). Sub-frame crumb ranges are
     REFUSED (never executed — a blade there overcuts the host clip).
-    For large sweeps pass max_spans=N (e.g. 20): cuts the rightmost N spans,
+    For large sweeps pass max_spans=N: cuts the rightmost N primary clip pieces,
     returns `pending` — re-call with the same ranges (file-stable, safe to
     re-resolve) until `remaining` is 0. Sum each call's `undo_steps` to revert.
     """
@@ -1366,11 +1731,14 @@ def delete_words(start_index: int = 0, count: int = 0, dry_run: bool = True,
             spans, texts, skipped, refused = _word_ranges_to_spans(rpc, batch)
         except BridgeError as e:
             return {"ok": False, "error": str(e)}
+        edge_warnings = _word_range_edge_notes(rpc, batch)
         if dry_run or (not spans and refused):
             out = {"dry_run": True, "spans": spans, "texts": texts, "skipped": skipped,
                    "would_remove_s": round(sum(b - a for a, b in spans), 3)}
             if refused:
                 out["refused"] = refused
+            if edge_warnings:
+                out["edge_warnings"] = edge_warnings
             if not ranges and spans:
                 # compat: single-range callers expect span/text
                 out["span"] = spans[0]
@@ -1386,6 +1754,8 @@ def delete_words(start_index: int = 0, count: int = 0, dry_run: bool = True,
         report["skipped"] = skipped
         if refused:
             report["refused"] = refused
+        if edge_warnings:
+            report["edge_warnings"] = edge_warnings
         return report
 
     return logged("delete_words", args, run)
@@ -1453,6 +1823,99 @@ def move_words(start_index: int, count: int, dest_index: int, dry_run: bool = Tr
     return logged("move_words", args, run)
 
 
+@mcp.tool()
+def split_words(at_index: int, dry_run: bool = True) -> dict:
+    """Blade the timeline at a word boundary WITHOUT deleting (Enter-to-split).
+
+    at_index is the file-stable word index starting the RIGHT half
+    (1..len-1 — a word must remain on each side). The blade lands in the
+    inter-word gap (midpoint when the gap exists, else the shared edge),
+    never mid-phoneme. One blade, one undo entry. Duration must be
+    preserved and the primary clip count must grow by exactly one —
+    verified after. A boundary already sitting on an edit point returns
+    already_split (idempotent, no write). A boundary whose words were
+    already cut away refuses.
+    """
+    args = {"at_index": at_index, "dry_run": dry_run}
+
+    def run(rpc):
+        try:
+            at = int(at_index)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "at_index must be an int word index"}
+        t = _fresh_transcript(rpc)
+        cw = t.get("words", [])
+        if cw and "f_start" not in cw[0]:
+            return {"ok": False, "error": "transcript predates file-relative times — re-run transcribe once"}
+        if not (1 <= at < len(cw)):
+            return {"ok": False, "error": f"at_index {at} outside splittable range 1..{len(cw) - 1} (need a word on each side)"}
+        media = t.get("media_path")
+        if media is None:
+            return {"ok": False, "error": "transcript has no media_path — re-run transcribe"}
+        clips = _all_existing_clips(rpc)
+        if media in _trim_health(clips):
+            return {"ok": False, "error": ("trim_start_s is 0 for every clip sharing "
+                                           f"{str(media)[:80]}… (bridge unclippedRange bug) — refusing to place a blade. "
+                                           "Fix the bridge (see docs/bridge.md), then retry.")}
+        prev, nxt = cw[at - 1], cw[at]
+        try:
+            gap_a, gap_b = float(prev["f_end"]), float(nxt["f_start"])
+        except (KeyError, TypeError, ValueError):
+            return {"ok": False, "error": "transcript words lack file times — re-run transcribe"}
+        # Both flanking words must still be live — else the halves are
+        # already two slices (or one side is gone entirely).
+        for w, side in ((prev, "left"), (nxt, "right")):
+            try:
+                frags = _resolve_file_interval(clips, media, float(w["f_start"]), float(w["f_end"]),
+                                               strict=True)
+            except BridgeError as e:
+                return {"ok": False, "error": str(e)}
+            if sum(b - a for a, b in frags) < SILENCE_FRAME:
+                return {"ok": False, "error": f"{side} word '{w.get('w', '')}' is already cut away — nothing to split"}
+        f = round((gap_a + gap_b) / 2, 3) if gap_b > gap_a else round(gap_a, 3)
+        owner, of0 = None, 0.0
+        for c in clips:
+            f0, f1 = _clip_file_window(c)
+            if f0 <= f <= f1:
+                owner, of0 = c, f0
+                break
+        if owner is None:
+            return {"ok": False, "error": "split boundary was already cut away — re-read get_story"}
+        tl = round(float(owner["timeline_start_s"]) + (f - of0), 3)
+        if _near_point(tl, _timeline_edit_points(clips=clips)):
+            return {"ok": True, "already_split": True, "at_t": tl,
+                    "between": [prev.get("w", ""), nxt.get("w", "")],
+                    "note": "boundary already sits on an edit point — no blade issued"}
+        if dry_run:
+            return {"dry_run": True, "at_t": tl, "gap_s": round(max(0.0, gap_b - gap_a), 3),
+                    "between": [prev.get("w", ""), nxt.get("w", "")]}
+        with _WRITE_LOCK:
+            before = _clips(rpc)
+            dur0 = float(before.get("duration_s", 0))
+            n0 = len([c for c in before.get("clips", [])
+                      if c.get("lane") in (None, "primary") and not c.get("container")])
+            rpc("playback.seek", {"t_s": tl})
+            rpc("timeline.action", {"action": "blade"})
+            after = _clips(rpc)
+            dur1 = float(after.get("duration_s", 0))
+            n1 = len([c for c in after.get("clips", [])
+                      if c.get("lane") in (None, "primary") and not c.get("container")])
+            if abs(dur1 - dur0) < 0.15 and n1 == n0 + 1:
+                return {"ok": True, "split": True, "at_t": tl, "undo_steps": 1,
+                        "between": [prev.get("w", ""), nxt.get("w", "")],
+                        "duration_before_s": round(dur0, 3), "duration_after_s": round(dur1, 3),
+                        "verify": "ok"}
+            try:
+                rpc("timeline.undo")
+            except BridgeError:
+                pass
+            return {"ok": False, "verify": f"FAILED: split did not verify (duration {dur0:.3f}s -> {dur1:.3f}s, "
+                    f"primary clips {n0} -> {n1}) — blade reverted",
+                    "at_t": tl, "undo_steps": 0}
+
+    return logged("split_words", args, run)
+
+
 # ---------------------------------------------------------------- story tools
 
 
@@ -1484,17 +1947,21 @@ def get_story(search: str | None = None, limit: int = 200, offset: int = 0,
             s = search.lower()
             rows = [f for f in rows if s in f["text"].lower()]
         total = len(rows)
-        rows = rows[max(0, offset): max(0, offset) + max(1, limit)]
+        start = max(0, offset)
+        rows = rows[start: start + max(1, limit)]
         if detail == "full":
-            lines = [{k: v for k, v in f.items() if v is not None} for f in rows]
+            lines = [{k: v for k, v in f.items() if v is not None and not k.startswith("_")}
+                     for f in rows]
         else:
             lines = [{"id": f["id"], "text": f["text"],
+                      **({"crumb": True} if _story_crumb(f) else {}),
                       **({"take_group": f["take_group"]}
                          if f.get("take_group") in open_ids else {})}
                      for f in rows]
         out: dict = {"clip": t.get("clip"), "line_count": total,
                      "lines": lines, "removed_lines": missing,
-                     "take_groups": shown_groups}
+                     "take_groups": shown_groups,
+                     "next_offset": start + len(lines) if start + len(lines) < total else None}
         try:
             bad = _trim_health(_all_existing_clips(rpc))
         except BridgeError:
@@ -1516,7 +1983,7 @@ def _execute_story_plan(rpc, plan: dict, max_spans: int | None, label: str) -> d
     _WRITE_LOCK. Returns the commit report.
     """
     undos = 0
-    report: dict = {}
+    report: dict = {"planned_clip_pieces": plan.get("clip_pieces", 0)}
     if plan["spans"]:
         try:
             cut = _cut_spans(rpc, plan["spans"], label, max_spans)
@@ -1524,13 +1991,47 @@ def _execute_story_plan(rpc, plan: dict, max_spans: int | None, label: str) -> d
             return {"ok": False, "error": str(e)}
         undos += cut.get("undo_steps", 0)
         report.update(cut)
+        if not cut.get("ok", True):
+            report["moves_pending"] = plan["moves"]
+            report["will_remove"] = plan["will_remove"]
+            return report
         if cut.get("remaining"):
             report["moves_pending"] = plan["moves"]
             report["will_remove"] = plan["will_remove"]
-            report["note"] = ("chunked: finish drops with cut_spans(pending) "
-                              "until remaining is 0, then re-run with the same ids "
-                              "for any moves")
+            if label == "apply_story":
+                report["note"] = ("chunked: re-call apply_story with the same keep list "
+                                  "until remaining is 0; each call re-plans from live clips")
+            else:
+                report["note"] = ("chunked: finish drops with cut_spans(pending) "
+                                  "until remaining is 0, then re-plan any moves")
             return report
+        # Duration alone cannot prove the requested story lines disappeared.
+        # A clip can shrink by the right amount while a partially cut line
+        # remains. Keep the model's verification in the same terms as its plan.
+        wanted_gone = {f["id"] for f in plan["will_remove"]}
+        still_live = []
+        crumbs_left = []
+        if wanted_gone:
+            live, _ = _story_live(rpc, _fresh_transcript(rpc))
+            for f in live:
+                if f["id"] not in wanted_gone or f.get("removed"):
+                    continue
+                remainder = round(f["t_end"] - f["t_start"], 3)
+                item = {"id": f["id"], "text": f["text"], "remaining_s": remainder}
+                if remainder < SILENCE_FRAME:
+                    crumbs_left.append({**item, "reason": "sub-frame crumb left in place"})
+                else:
+                    still_live.append(item)
+        if still_live:
+            report["ok"] = False
+            report["verify"] = f"FAILED: {len(still_live)} planned story line(s) still present"
+            report["still_present"] = still_live
+            report["moves_pending"] = plan["moves"]
+            return report
+        report["removed_story_lines"] = len(wanted_gone) - len(crumbs_left)
+        if crumbs_left:
+            report["unremoved"] = report.get("unremoved", []) + crumbs_left
+            report["story_verify"] = "ok_with_subframe_crumbs"
     moves_done = []
     dur0, _ = _settle(rpc, tries=2, pause_s=0.2)
     with _WRITE_LOCK:
@@ -1541,37 +2042,87 @@ def _execute_story_plan(rpc, plan: dict, max_spans: int | None, label: str) -> d
             anchor_id = m.get("after") or m.get("before")
             anchor = by_id.get(anchor_id) if anchor_id else None
             if src is None or (anchor_id and anchor is None):
-                moves_done.append({**m, "error": "anchor/src cut away mid-batch — re-plan"})
-                continue
-            span = (src["t_start"], src["t_end"])
+                moves_done.append({**m, "done": False,
+                                   "error": "anchor/src cut away mid-batch — re-plan"})
+                break
+            try:
+                span = _move_extent(src)
+                anchor_span = _move_extent(anchor) if anchor else None
+            except BridgeError as e:
+                moves_done.append({**m, "done": False, "error": str(e)})
+                break
             if m.get("after"):
-                dest_t = anchor["t_end"]
+                dest_t = anchor_span[1]
             elif m.get("before"):
-                dest_t = anchor["t_start"]
+                dest_t = anchor_span[0]
             else:
                 dest_t = 0.0
             if span[0] <= dest_t <= span[1]:
-                continue  # already in place after prior moves
-            _move_live_span(rpc, span, dest_t)
-            undos += 2  # cut + paste
-            moves_done.append({**m, "done": True})
+                check = _move_order_check(rpc, m)
+                moves_done.append({**m, "done": check["verified"],
+                                   "executed": False, "position": check})
+                if not check["verified"]:
+                    break
+                continue
+            try:
+                _, move_undos = _move_live_span(rpc, span, dest_t)
+            except BridgeError as e:
+                moves_done.append({**m, "done": False, "error": str(e)})
+                break
+            undos += move_undos
+            check = _move_order_check(rpc, m)
+            for _ in range(2):
+                if check["verified"]:
+                    break
+                time.sleep(0.2)
+                check = _move_order_check(rpc, m)
+            moves_done.append({**m, "done": check["verified"],
+                               "executed": True, "position": check})
+            if not check["verified"]:
+                break
     dur1, settled = _settle(rpc, tries=2, pause_s=0.2)
     tol = 0.15 + 0.05 * max(1, len(moves_done))
-    ok = abs(dur1 - dur0) < tol  # moves preserve duration
+    ok = (abs(dur1 - dur0) < tol and len(moves_done) == len(plan["moves"])
+          and all(m.get("done") for m in moves_done))
+    if ok and plan["moves"]:
+        live, _ = _story_live(rpc, _fresh_transcript(rpc))
+        active_ids = {f["id"] for f in live if not f.get("removed") and not _story_crumb(f)}
+        final_order = [fid for fid in _present_order(live) if fid in active_ids
+                       and fid in set(plan["keep"])]
+        expected_order = [fid for fid in plan["keep"] if fid in active_ids]
+        ok = final_order == expected_order
+        if not ok:
+            at = next((i for i, (want, got) in enumerate(zip(expected_order, final_order))
+                       if want != got), min(len(expected_order), len(final_order)))
+            report["order_mismatch"] = {
+                "index": at,
+                "expected_id": expected_order[at] if at < len(expected_order) else None,
+                "actual_id": final_order[at] if at < len(final_order) else None,
+                "expected_near": expected_order[max(0, at - 2):at + 3],
+                "actual_near": final_order[max(0, at - 2):at + 3]}
     report["moves"] = moves_done
     report["will_remove"] = plan["will_remove"]
     report["crumbs"] = plan["crumbs"]
     if plan.get("unremoved"):
-        report["unremoved"] = plan["unremoved"]
-    report["undo_steps"] = undos + report.get("undo_steps", 0)
+        report["unremoved"] = report.get("unremoved", []) + plan["unremoved"]
+    report["undo_steps"] = undos
+    report["duration_before_s"] = round(dur0, 3) if not plan["spans"] else report.get("duration_before_s")
+    report["duration_after_s"] = round(dur1, 3)
     report["moved_verify"] = ("ok" if ok else
-                              f"MISMATCH duration {dur0:.3f}s -> {dur1:.3f}s — undo(steps={report['undo_steps']}) to revert")
+                              f"FAILED: move position or story order did not verify; "
+                              f"see moves.position/order_mismatch; duration {dur0:.3f}s -> {dur1:.3f}s")
+    if not ok:
+        report["verify"] = report["moved_verify"]
+    else:
+        report["verify"] = "ok"
+    report["ok"] = ok
+    report.setdefault("remaining", 0)
     report["settled"] = settled and report.get("settled", True)
     return report
 
 
 @mcp.tool()
-def apply_story(keep: list, dry_run: bool = True,
+def apply_story(keep: list[str], dry_run: bool = True,
                 max_spans: int | None = None) -> dict:
     """Rough cut + reorder in one verb: declare what stays and in what order.
 
@@ -1580,8 +2131,9 @@ def apply_story(keep: list, dry_run: bool = True,
     orphan crumbs); cuts run right-to-left; reorders run as minimal
     anchor moves after the drops. dry_run=True (default) returns
     will_remove as TEXT plus moves — verify by eye, no seconds math.
-    For large drops pass max_spans=N: cuts the rightmost N drop spans,
-    returns `pending` — finish with cut_spans(pending) until remaining=0.
+    Each call cuts at most 40 primary clip pieces by default; max_spans
+    overrides that cap. If `remaining` is nonzero, re-call with the same
+    keep list: file-anchored drops are re-planned from live clips.
     """
     args = {"keep": keep, "dry_run": dry_run, "max_spans": max_spans}
 
@@ -1589,9 +2141,14 @@ def apply_story(keep: list, dry_run: bool = True,
         plan = _story_plan(rpc, list(keep or []))
         if not plan.get("ok"):
             return plan
-        if dry_run or (not plan["spans"] and not plan["moves"]):
+        if dry_run:
             plan["dry_run"] = True
             return plan
+        if not plan["spans"] and not plan["moves"]:
+            return {"ok": True, "already_applied": True, "remaining": 0,
+                    "verify": "ok_with_subframe_crumbs" if plan.get("unremoved") else "ok",
+                    "undo_steps": 0,
+                    **({"unremoved": plan["unremoved"]} if plan.get("unremoved") else {})}
         return _execute_story_plan(rpc, plan, max_spans, "apply_story")
 
     return logged("apply_story", args, run)
@@ -1666,7 +2223,7 @@ def _check_line_ids(frags: list, ids: list, what: str = "ids") -> str | None:
 
 
 @mcp.tool()
-def delete_lines(ids: list, dry_run: bool = True,
+def delete_lines(ids: list[str], dry_run: bool = True,
                  max_spans: int | None = None) -> dict:
     """Delete story lines by id (see get_story) and ripple the video.
 
@@ -1707,8 +2264,9 @@ def move_line(id: str, after_id: str | None = None,
               before_id: str | None = None, dry_run: bool = True) -> dict:
     """Move one story line after/before an anchor line (see get_story).
 
-    Exactly one of after_id / before_id. Anchors re-resolve after the
-    cut closes the gap. Duration is preserved — verified after.
+    Exactly one of after_id / before_id. Each line's movable extent uses
+    its one frame-sized live span; remote source crumbs cannot stretch it.
+    Discontinuous lines refuse. The final neighbor and duration are checked.
     """
     args = {"id": id, "after_id": after_id, "before_id": before_id, "dry_run": dry_run}
 
@@ -1743,26 +2301,14 @@ def move_line(id: str, after_id: str | None = None,
 
 
 def _normalize_choices(choices) -> list:
-    """Accept {group: keep} or [{group, keep}]/[[group, keep]]."""
-    if isinstance(choices, dict):
-        items = list(choices.items())
-    elif isinstance(choices, list):
-        items = []
-        for c in choices:
-            if isinstance(c, (list, tuple)) and len(c) == 2:
-                items.append((c[0], c[1]))
-            elif isinstance(c, dict) and "group" in c and "keep" in c:
-                items.append((c["group"], c["keep"]))
-            else:
-                raise BridgeError(f"choices entries must be [group, keep] or {{group, keep}} — got {str(c)[:80]}")
-    else:
-        raise BridgeError("choices must be {group: keep} or a list of [group, keep]")
-    if not items:
+    """Validate the single public shape: {group_id: keep_line_id}."""
+    if not isinstance(choices, dict):
+        raise BridgeError("choices must be an object {group_id: keep_line_id}")
+    if not choices:
         raise BridgeError("choices is empty — nothing to resolve")
-    groups = [g for g, _ in items]
-    if len(set(groups)) != len(groups):
-        raise BridgeError(f"duplicate groups in choices: {sorted({g for g in groups if groups.count(g) > 1})[:5]}")
-    return items
+    if not all(isinstance(g, str) and isinstance(k, str) for g, k in choices.items()):
+        raise BridgeError("choices keys and values must be story id strings")
+    return list(choices.items())
 
 
 def _validate_takes_choices(frags: list, items: list) -> tuple:
@@ -1803,11 +2349,11 @@ def _validate_takes_choices(frags: list, items: list) -> tuple:
 
 
 @mcp.tool()
-def choose_takes(choices, dry_run: bool = True,
+def choose_takes(choices: dict[str, str], dry_run: bool = True,
                  max_spans: int | None = None) -> dict:
     """Resolve many retake groups in ONE validated batch (see get_story).
 
-    choices = {group: keep_id} (or [[group, keep], ...]). Every group
+    choices = {group: keep_id}. Every group
     and keep is validated BEFORE any write — one bad entry refuses the
     whole batch, never a half-resolved timeline. One plan, one undo depth.
     """
@@ -1870,7 +2416,8 @@ def _review_state(rpc) -> dict:
     open_g = [g for g in groups if not g["resolved"]]
     by_id = {f["id"]: f for f in frags}
     crumbs = [{"id": f["id"], "text": f["text"],
-               "dur_s": round(f["t_end"] - f["t_start"], 3)}
+               "dur_s": round(f["t_end"] - f["t_start"], 3),
+               "subframe": _story_crumb(f)}
               for f in frags if not f.get("removed")
               and (f["t_end"] - f["t_start"]) < CRUMB_WARN_S]
     dur = _clips(rpc).get("duration_s", 0)
@@ -1879,7 +2426,12 @@ def _review_state(rpc) -> dict:
         open_items.append(f"{len(open_g)} take group(s) unresolved — resolve with choose_takes, then re-review")
     notes = []
     if crumbs:
-        notes.append(f"{len(crumbs)} crumb line(s) under {CRUMB_WARN_S}s left in place — inaudible, safe to leave")
+        tiny = sum(1 for c in crumbs if c["subframe"])
+        if tiny:
+            notes.append(f"{tiny} sub-frame remnant(s) uncuttable")
+        if len(crumbs) > tiny:
+            notes.append(f"{len(crumbs) - tiny} short fragment(s) under "
+                         f"{CRUMB_WARN_S}s may be audible — audition if they matter")
     if missing:
         notes.append(f"{missing} line(s) already removed earlier in the session")
     return {"clip": t.get("clip"), "duration_s": round(dur, 3),
@@ -1890,7 +2442,9 @@ def _review_state(rpc) -> dict:
                 {"id": m, "text": by_id[m]["text"]} for m in g["active"]]} for g in open_g],
             "open_take_count": len(open_g),
             "resolved_take_count": sum(1 for g in groups if g["resolved"]),
-            "crumbs": crumbs, "open_items": open_items, "notes": notes,
+            "crumbs": crumbs, "subframe_crumb_count": sum(c["subframe"] for c in crumbs),
+            "short_fragment_count": sum(not c["subframe"] for c in crumbs),
+            "open_items": open_items, "notes": notes,
             "ready": not open_items,
             "gate": ("DONE — nothing open" if not open_items else
                      "NOT DONE — do not finish until open_items is empty")}
@@ -1898,10 +2452,10 @@ def _review_state(rpc) -> dict:
 
 @mcp.tool()
 def review() -> dict:
-    """End-of-run gate: what is still open (takes, crumbs) + duration walk.
+    """Story-decision gate: open takes, short fragments, duration walk.
 
-    The checkable definition of done. Do not finish an edit while
-    `open_items` is non-empty — resolve with choose_takes, then re-review.
+    `ready` means no unresolved take groups. Short fragments remain listed
+    for an optional listening check; this is not an audio quality verdict.
     Reads only; never writes, never spawns an engine.
     """
     return logged("review", {}, _review_state)
@@ -2004,11 +2558,10 @@ def verify_action(note: str = "", detail: str = "summary") -> dict:
 def undo(steps: int = 1) -> dict:
     """Undo `steps` entries via FCP's undo manager.
 
-    One delete_words/remove_silences span costs up to 3 entries (2 blades +
-    1 delete, fewer at edit-point boundaries); each tool reports its exact
-    `undo_steps` — pass it back here to revert the whole call. Blades leave
-    split points behind, so a single undo restores content but NOT the
-    un-split timeline (Bug 2): always undo the full reported depth.
+    A successful cut piece normally costs up to 3 entries (2 blades +
+    1 delete). `undo_steps` counts issued actions; after a failed action,
+    FCP may have created fewer undo entries. Inspect the live timeline
+    and undo history before bulk undo of a failed call.
     """
     args = {"steps": steps}
 

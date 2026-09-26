@@ -3,10 +3,9 @@
 Minimal agent bridge for Final Cut Pro. Extracts only the load-bearing core
 from [SpliceKit](https://github.com/elliotttate/SpliceKit) (MIT):
 
-- **patch** — copy App Store FCP, inject a tiny dylib, re-sign, launch (~150 loc)
-- **bridge** — small ObjC dylib, TCP JSON-RPC on `127.0.0.1:9876`, ~15 verbs (~500 loc, TODO)
-- **mcp** — stdio MCP server, ~12 tools shaped like WeftCut's (`detect_pauses` /
-  `remove_pauses` / `apply_cut_list` / `transcribe_clip`) (~700 loc)
+- **patch** — copy App Store FCP, inject a dylib, re-sign, launch
+- **bridge** — ObjC dylib, TCP JSON-RPC on `127.0.0.1:9876`
+- **mcp** — stdio MCP server with story, word, silence, and timeline tools
 - **tools** — vendored `silence-detector.swift` + `parakeet-transcriber`, run as
   **subprocesses** (never in-process, so a crash can't take FCP down)
 
@@ -41,12 +40,14 @@ Then point opencode at the MCP server (see `mcp/client-config.json`).
 1. **Identity, not time.** Clips carry session-stable IDs (`timeline.select`
    confirms membership + selection before anything acts). Timestamps are
    resolved at commit, never stored in a plan.
-2. **Validate whole, then write once.** Destructive ops compute the full cut
-   list first and refuse on any invalid range.
+2. **Validate whole, then cut serially.** Destructive ops compute the full cut
+   list first, split it at primary clip edges, and verify each cut. FCP does
+   not provide one atomic transaction for the batch.
 3. **Revert, never wrong-cut.** A select miss auto-reverts its blades; a stale
    ID refuses; a stale transcript (timeline rippled since transcribe) refuses.
-4. **Verify after write.** Duration delta checked within ~4 frames; a mismatch
-   names the revert (`undo Nx`) instead of staying silent.
+4. **Verify after write.** Merged ranges are split at primary clip edges;
+   each delete must ripple by its requested piece before the next runs.
+   Story commits also check that planned lines disappeared.
 5. **`dry_run` everywhere** (default on). Rehearse the exact op, commit nothing.
 6. **Out-of-process inference.** Parakeet/silence run as CLIs over source
    files. Transcript cache is JSON on disk keyed by file+model — a read never
@@ -54,9 +55,11 @@ Then point opencode at the MCP server (see `mcp/client-config.json`).
 7. **JSONL or it didn't happen.** `~/.local/share/fcp-mcp-lite/calls.jsonl`
    records every call. `tail -f` it via `make logs`.
 
-Known v0 limits: a batch is N undo entries, not one (`undo_steps` reported —
-pass it to `undo(steps=…)` to revert one call; blades at existing edit
-points are skipped so boundary-aligned cuts cost 1 entry);
+Known v0 limits: a batch is N undo entries, not one (`undo_steps` counts
+issued blade/delete actions, but FCP's undo manager can differ after a
+failed action; inspect before a bulk undo). Blades at existing edit points
+are skipped so boundary-aligned cuts cost 1 entry. Cuts are capped at 40
+primary clip pieces per call by default and return `pending` for continuation;
 single-user assumed (concurrent hand-editing skews verify counts);
 cut targeting is primary-storyline-first, connected timelines often miss
 (guarded, never wrong).
