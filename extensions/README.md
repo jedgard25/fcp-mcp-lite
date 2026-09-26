@@ -1,14 +1,13 @@
-# extensions — optional second-tier extras
+# extensions — the transcript editor lives here
 
 Core (`patch/`, `bridge/`, `mcp/`, `tools/`) stays lean and dependency-free.
-Everything under `extensions/` is:
-
-- optional (never installed by `make mcp-setup`, never imported by core),
-- self-contained (own README, own entrypoint, stdlib-first),
-- agent-launchable (`make ui`, background `bash`, then drive via browser).
+`extensions/transcript-ui/` is the single editor frontend (no separate native
+apps, no legacy variants):
 
 | Extension | What | Launch |
 |---|---|---|
-| `transcript-ui/` | Local API service; also retains the legacy web editor | `make ui` → http://127.0.0.1:8765 |
-| `transcript-applet/` | Native floating card editor: Enter to split, Delete to trim, animated reordering | `make ui` + `make applet` |
-| `transcript-workflow/` | Same cards as a literal FCP panel (Workflow Extension `.appex`); status until transcribed | `make ui` + `make workflow` |
+| `transcript-ui/` | FCP-styled slice editor over the revision-checked `/api/editor` model; the in-process FCP panel (Window > Transcript) loads this page | `make ui` → http://127.0.0.1:8765 |
+
+The panel never opens on its own — it appears only via
+**Window > Transcript** (⌘0) in patched FCP, so users who don't want it
+never see it.

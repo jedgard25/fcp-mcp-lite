@@ -1,0 +1,37 @@
+{
+  "": {
+    "dependencies": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/TranscriptApplet.d",
+    "object": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/TranscriptApplet.o",
+    "swift-dependencies": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/primary.swiftdeps"
+  },
+  "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/Sources/API.swift": {
+    "object": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/API.swift.o",
+    "swiftmodule": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/API~partial.swiftmodule",
+    "swift-dependencies": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/API.swiftdeps",
+    "diagnostics": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/API.dia"
+  },
+  "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/Sources/ContentView.swift": {
+    "object": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/ContentView.swift.o",
+    "swiftmodule": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/ContentView~partial.swiftmodule",
+    "swift-dependencies": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/ContentView.swiftdeps",
+    "diagnostics": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/ContentView.dia"
+  },
+  "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/Sources/EditorView.swift": {
+    "object": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/EditorView.swift.o",
+    "swiftmodule": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/EditorView~partial.swiftmodule",
+    "swift-dependencies": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/EditorView.swiftdeps",
+    "diagnostics": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/EditorView.dia"
+  },
+  "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/Sources/Model.swift": {
+    "object": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/Model.swift.o",
+    "swiftmodule": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/Model~partial.swiftmodule",
+    "swift-dependencies": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/Model.swiftdeps",
+    "diagnostics": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/Model.dia"
+  },
+  "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/Sources/TranscriptApplet.swift": {
+    "object": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/TranscriptApplet.swift.o",
+    "swiftmodule": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/TranscriptApplet~partial.swiftmodule",
+    "swift-dependencies": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/TranscriptApplet.swiftdeps",
+    "diagnostics": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/release/TranscriptApplet.build/TranscriptApplet.dia"
+  }
+}

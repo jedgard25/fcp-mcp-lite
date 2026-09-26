@@ -1,0 +1,12 @@
+{
+  "": {
+    "swift-dependencies": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-workflow/.build/arm64-apple-macosx/debug/TranscriptWorkflowTests.build/primary.swiftdeps"
+  },
+  "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-workflow/Tests/WorkflowTests.swift": {
+    "dependencies": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-workflow/.build/arm64-apple-macosx/debug/TranscriptWorkflowTests.build/WorkflowTests.d",
+    "object": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-workflow/.build/arm64-apple-macosx/debug/TranscriptWorkflowTests.build/WorkflowTests.swift.o",
+    "swiftmodule": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-workflow/.build/arm64-apple-macosx/debug/TranscriptWorkflowTests.build/WorkflowTests~partial.swiftmodule",
+    "swift-dependencies": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-workflow/.build/arm64-apple-macosx/debug/TranscriptWorkflowTests.build/WorkflowTests.swiftdeps",
+    "diagnostics": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-workflow/.build/arm64-apple-macosx/debug/TranscriptWorkflowTests.build/WorkflowTests.dia"
+  }
+}

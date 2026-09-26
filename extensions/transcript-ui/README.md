@@ -1,38 +1,35 @@
-# transcript-ui — optional autocommitting transcript editor
+# transcript-ui — the transcript editor (single clean path)
 
-Second-tier extension. Not installed with core, not imported by core/tests,
-zero new dependencies (stdlib HTTP + the venv you already have).
+FCP-inspector-styled slice editor. Each card is a sentence intersected with
+one physical clip (`S…` slice ids, file-anchored word indices — never shift
+after cuts). Every action commits immediately through `mcp/server.py` (same
+validation + JSONL log as the agent verbs), so the change lands live in FCP.
 
-Each story line is an object (`L####`, file-anchored — never shifts after cuts).
-Every action commits immediately: delete / drop-reorder / edge-trim writes
-through `mcp/server.py` (same validation + JSONL log as the agent verbs),
-so the change swaps live in FCP.
+The in-process FCP panel (**Window > Transcript**, ⌘0) loads this page. It
+shows bridge/MCP status until a transcript exists; edits stay disabled while
+the snapshot carries `edit_error`.
 
-## Run (human or agent)
+## Run
 
 ```sh
-make ui            # http://127.0.0.1:8765 — venv python, background it if needed
-make ui PORT=8770  # custom port
+make ui            # http://127.0.0.1:8765 — leave running; the FCP panel reads it
+make ui PORT=8770  # custom port (panel honors TRANSCRIPT_UI_PORT)
 ```
 
-Agent flow: `bash` launch `make ui` in background, `webfetch`/browser the URL,
-or drive `/api/*` directly. No FCP UI injection — the patched bridge stays
-the only in-process code.
+Open http://127.0.0.1:8765 in a browser to drive the same editor outside FCP.
 
 ## What each control does
 
-Literal text editing — every row is editable text, every keystroke-targeted
-change commits on focus loss:
-
-| Control | Backend (commit, `dry_run=False`) | Notes |
+| Control | Backend intent (`POST /api/editor/edit`) | Notes |
 |---|---|---|
-| type / delete words | `delete_words(ranges=…)` (one validated batch) | delete-only: new/edited words are refused + reverted — speech can't be synthesized. Clearing a row routes to `delete_lines` (midpoint-safe blades). |
-| Backspace from row start/end | edge `delete_words` | trims the slice, like trimming the clip head/tail |
-| delete mid-sentence words | mid `delete_words` | cuts those words: jump cut, splice continuity broken (reported, not an error) |
-| Enter with caret mid-row | `split_words` (blade, duration-preserving, verified) | splits AFTER the word under the caret (caret at word start splits before it). Needs a word each side. FCP shows two clips; the row earns a ✂ badge. |
-| 🗑 delete | `delete_lines([id])` + auto-follow `cut_spans(pending)` | refuses to delete the last line; sub-frame crumbs stay, reported |
-| drag ⠿ reorder | `apply_story(keep=[ids in DOM order])`, auto-looped to `remaining=0` | drop above/below middle = before/after; order verified server-side |
+| Select words + **Delete** (or Backspace with no selection trims the preceding word) | `trim` with those word ids | cuts those words: jump cut, splice continuity broken (reported, not an error) |
+| **Enter** with caret in a card | `split` after the word under the caret | needs a word each side; FCP shows two clips |
+| 🗑 delete | `delete` (whole slice) | sub-frame crumbs stay, reported |
+| Drag ⋮⋮ grip | `move` (`before_id`, null = end) | disabled while searching; optimistic order until the verified snapshot arrives |
+| Type / paste new words | refused + reverted | speech can only be cut, never synthesized |
 
-`GET /api/story` returns full-detail lines (`id, text, start_word, end_word,
-t_start/t_end, take_group, removed`) so trim buttons always have word indices.
-`GET /api/review` is the take-group gate, not a clean-script verdict.
+`GET /api/editor` returns the snapshot (`revision, timeline, title, duration,
+slices, edit_error`). Every edit carries `revision` + word-identity anchors;
+a card that changed in FCP is refused as `stale` and the fresh timeline is
+shown. A failed write locks editing until manual refresh — inspect FCP first.
+Background sync re-reads every 2s while idle.

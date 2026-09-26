@@ -1,0 +1,19 @@
+{
+  "": {
+    "swift-dependencies": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/debug/TranscriptAppletTests.build/primary.swiftdeps"
+  },
+  "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/Tests/CardTextTests.swift": {
+    "dependencies": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/debug/TranscriptAppletTests.build/CardTextTests.d",
+    "object": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/debug/TranscriptAppletTests.build/CardTextTests.swift.o",
+    "swiftmodule": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/debug/TranscriptAppletTests.build/CardTextTests~partial.swiftmodule",
+    "swift-dependencies": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/debug/TranscriptAppletTests.build/CardTextTests.swiftdeps",
+    "diagnostics": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/debug/TranscriptAppletTests.build/CardTextTests.dia"
+  },
+  "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/Tests/ModelTests.swift": {
+    "dependencies": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/debug/TranscriptAppletTests.build/ModelTests.d",
+    "object": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/debug/TranscriptAppletTests.build/ModelTests.swift.o",
+    "swiftmodule": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/debug/TranscriptAppletTests.build/ModelTests~partial.swiftmodule",
+    "swift-dependencies": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/debug/TranscriptAppletTests.build/ModelTests.swiftdeps",
+    "diagnostics": "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-applet/.build/arm64-apple-macosx/debug/TranscriptAppletTests.build/ModelTests.dia"
+  }
+}

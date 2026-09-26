@@ -1,21 +1,16 @@
-"""transcript-ui backend — optional extension, stdlib only.
+"""transcript-ui backend — the single editor frontend, stdlib only.
 
 Reuses mcp/server.py as the brain (same validation, file->timeline
-re-resolve, JSONL logging), exposes a tiny autocommitting HTTP API for
-index.html. No new deps, nothing imported by core.
+re-resolve, JSONL logging), exposes the slice-model API for index.html
+(the FCP-styled card editor the in-process panel loads).
 
-  make ui   ->  http://127.0.0.1:8765  (agent-launchable via background bash)
+  make ui   ->  http://127.0.0.1:8765
 
-API (all POSTs commit immediately, dry_run=False — change = FCP moves):
-  GET  /api/status   bridge reachability + versions
-  GET  /api/story    full-detail story lines (id, text, start/end_word, crumbs)
-  GET  /api/review   take-group gate
-  POST /api/delete   {ids:[...]}            -> delete_lines(commit)
-  POST /api/move     {id, after_id|before_id} -> move_line(commit, single hop)
-  POST /api/reorder  {keep:[ids in order]}  -> apply_story(commit, full order)
-  POST /api/trim     {start_index, count}   -> delete_words(commit, edge trim)
-  POST /api/split    {at_index} | {id, after_word} -> split_words(commit, Enter-to-split)
-  POST /api/cut      {spans:[[a,b],...]}    -> cut_spans(commit, chunk continue)
+API:
+  GET  /              the editor page
+  GET  /api/editor    snapshot (revision, timeline, title, duration, slices, edit_error)
+  GET  /api/status    bridge reachability + versions
+  POST /api/editor/edit  {revision, action, id, before_id?, words?} (commits immediately)
 """
 
 import argparse
@@ -81,19 +76,6 @@ class Handler(BaseHTTPRequestHandler):
                 _json(self, editor_service.read())
             elif path == "/api/status":
                 _json(self, mcp_server.bridge_status())
-            elif path == "/api/story":
-                story = mcp_server.get_story(detail="full", limit=500)
-                # Lightweight word tokens so clients can render literal text
-                # (id-indexed words, no timings — indices are the API).
-                try:
-                    t = mcp_server._last_transcript() or {}
-                    story["words"] = [{"i": w["i"], "w": w["w"]}
-                                      for w in t.get("words", [])]
-                except Exception:
-                    story["words"] = []
-                _json(self, story)
-            elif path == "/api/review":
-                _json(self, mcp_server.review())
             else:
                 _json(self, {"ok": False, "error": f"unknown route {path}"}, 404)
         except Exception as e:  # never drop the connection without an answer
@@ -120,78 +102,6 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(body, dict):
                     return _json(self, {"ok": False, "error": "JSON object required"}, 400)
                 _json(self, editor_service.edit(body))
-            elif path == "/api/delete":
-                ids = body.get("ids") or []
-                if not isinstance(ids, list) or not ids:
-                    return _json(self, {"ok": False, "error": "ids:[...] required"}, 400)
-                _json(self, mcp_server.delete_lines(ids=ids, dry_run=False))
-            elif path == "/api/move":
-                lid = body.get("id")
-                after, before = body.get("after_id"), body.get("before_id")
-                if not lid or (after is None) == (before is None):
-                    return _json(self, {"ok": False, "error": "need id + exactly one of after_id/before_id"}, 400)
-                _json(self, mcp_server.move_line(id=lid, after_id=after, before_id=before, dry_run=False))
-            elif path == "/api/reorder":
-                keep = body.get("keep") or []
-                if not isinstance(keep, list) or not keep:
-                    return _json(self, {"ok": False, "error": "keep:[ids in order] required"}, 400)
-                # Auto-follow chunking: same keep list re-plans from live clips.
-                report = None
-                for _ in range(10):
-                    report = mcp_server.apply_story(keep=keep, dry_run=False)
-                    if not isinstance(report, dict) or not report.get("remaining"):
-                        break
-                _json(self, report if isinstance(report, dict) else {"ok": False, "error": "empty reorder result"})
-            elif path == "/api/trim":
-                # {start_index, count} or {ranges:[[start,count],...]} for
-                # multi-range literal edits (one validated batch, one undo depth).
-                ranges = body.get("ranges")
-                if ranges is not None:
-                    try:
-                        ranges = [[int(a), int(b)] for a, b in ranges]
-                    except (TypeError, ValueError):
-                        return _json(self, {"ok": False, "error": "ranges must be [[start,count],...]"}, 400)
-                    if not ranges or any(b <= 0 for _, b in ranges):
-                        return _json(self, {"ok": False, "error": "ranges must be non-empty with count > 0"}, 400)
-                    _json(self, mcp_server.delete_words(ranges=ranges, dry_run=False))
-                    return
-                try:
-                    si, co = int(body.get("start_index", 0)), int(body.get("count", 0))
-                except (TypeError, ValueError):
-                    return _json(self, {"ok": False, "error": "start_index/count must be ints"}, 400)
-                if co <= 0:
-                    return _json(self, {"ok": False, "error": "count must be > 0"}, 400)
-                _json(self, mcp_server.delete_words(start_index=si, count=co, dry_run=False))
-            elif path == "/api/split":
-                # {at_index} or line-scoped {id, after_word} (split AFTER that
-                # word — clients speak line objects, the verb speaks indices).
-                at = body.get("at_index")
-                if at is None and body.get("id") is not None and body.get("after_word") is not None:
-                    try:
-                        aw = int(body["after_word"])
-                    except (TypeError, ValueError):
-                        return _json(self, {"ok": False, "error": "after_word must be an int"}, 400)
-                    story = mcp_server.get_story(detail="full", limit=500)
-                    line = next((ln for ln in story.get("lines", []) if ln.get("id") == body["id"]), None)
-                    if line is None:
-                        return _json(self, {"ok": False, "error": f"unknown line {body['id']} — refresh"}, 400)
-                    if not (line["start_word"] <= aw < line["end_word"]):
-                        return _json(self, {"ok": False, "error": "after_word must be inside the line (not past its last word)"}, 400)
-                    at = aw + 1
-                try:
-                    at = int(at)
-                except (TypeError, ValueError):
-                    return _json(self, {"ok": False, "error": "need at_index or {id, after_word}"}, 400)
-                _json(self, mcp_server.split_words(at_index=at, dry_run=False))
-            elif path == "/api/cut":
-                spans = body.get("spans") or body.get("pending") or []
-                try:
-                    spans = [[float(a), float(b)] for a, b in spans]
-                except (TypeError, ValueError):
-                    return _json(self, {"ok": False, "error": "spans must be [[a,b],...]"}, 400)
-                if not spans:
-                    return _json(self, {"ok": False, "error": "spans is empty"}, 400)
-                _json(self, mcp_server.cut_spans(spans=spans, dry_run=False))
             else:
                 _json(self, {"ok": False, "error": f"unknown route {path}"}, 404)
         except Exception as e:

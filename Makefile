@@ -1,7 +1,7 @@
 VENV ?= $(HOME)/.venvs/fcp-mcp-lite
 BRIDGE_PORT ?= 9876
 
-.PHONY: mcp-setup patch mcp-doctor logs test ui applet workflow
+.PHONY: mcp-setup patch mcp-doctor logs test ui
 
 UI_PORT ?= 8765
 
@@ -25,14 +25,5 @@ mcp-doctor:
 logs:
 	tail -f $(HOME)/.local/share/fcp-mcp-lite/calls.jsonl
 
-ui: # optional extension: autocommitting transcript editor (see extensions/transcript-ui/README.md)
+ui: # transcript editor (see extensions/transcript-ui/README.md)
 	$(VENV)/bin/python extensions/transcript-ui/ui_server.py --port $(UI_PORT)
-
-APPLET_PORT ?= 8765
-
-applet: # optional native extension: SwiftUI editor (needs `make ui` running; see extensions/transcript-applet/README.md)
-	./extensions/transcript-applet/build-app.sh
-	open extensions/transcript-applet/.build/Transcript.app --args --port $(APPLET_PORT)
-
-workflow: # optional FCP Workflow Extension panel (needs `make ui` running; see extensions/transcript-workflow/README.md)
-	./extensions/transcript-workflow/build-workflow-app.sh

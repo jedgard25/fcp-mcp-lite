@@ -1,0 +1,3 @@
+module TranscriptWorkflow {
+    header "/Users/evindrews/Projects/fcp-mcp-lite/extensions/transcript-workflow/.build/arm64-apple-macosx/debug/TranscriptWorkflow.build/include/TranscriptWorkflow-Swift.h"
+}
