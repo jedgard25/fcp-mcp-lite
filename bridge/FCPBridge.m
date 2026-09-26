@@ -1372,7 +1372,7 @@ static int FCB_uiPort(void) {
 
 - (NSURL *)serviceURL {
     return [NSURL URLWithString:
-        [NSString stringWithFormat:@"http://127.0.0.1:%d/", FCB_uiPort()]];
+        [NSString stringWithFormat:@"http://127.0.0.1:%d/?chrome=panel", FCB_uiPort()]];
 }
 
 - (void)openTranscript:(id)sender {
@@ -1396,6 +1396,15 @@ static int FCB_uiPort(void) {
             w.level = NSFloatingWindowLevel;
             w.collectionBehavior |= NSWindowCollectionBehaviorFullScreenAuxiliary;
             w.releasedWhenClosed = NO;
+            // Unified transparent titlebar: no separate titlebar band to
+            // mismatch FCP's chrome — the dark page flows under traffic
+            // lights + centered title (the page pads its top in ?chrome=panel
+            // mode). Forced dark so it never renders a light titlebar next
+            // to FCP's dark UI.
+            w.titlebarAppearsTransparent = YES;
+            w.titleVisibility = NSWindowTitleVisible;
+            if (@available(macOS 10.14, *))
+                w.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
             WKWebViewConfiguration *cfg = [[WKWebViewConfiguration alloc] init];
             WKWebView *web = [[WKWebView alloc] initWithFrame:frame configuration:cfg];
             web.navigationDelegate = self;

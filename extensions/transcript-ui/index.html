@@ -146,7 +146,11 @@
     font-size: 13px; padding: 3px 8px; margin-left: 2px;
     color: var(--faint);
   }
+  /* In-process panel mode (?chrome=panel): the native titlebar is transparent
+     and unified, so leave its 30pt zone empty for traffic lights + title. */
+  body.panel-chrome header { padding-top: 30px; }
   footer .iconbtn:hover { color: var(--txt); background: #38383a; }
+  body.panel-chrome header { padding-top: 30px; }
 </style>
 <header>
   <input id="search" type="search" placeholder="Search transcript" autocomplete="off">
@@ -550,6 +554,8 @@ document.addEventListener('keydown', ev => {
   if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === 'r') { ev.preventDefault(); refresh(); }
 });
 $('#search').addEventListener('input', ev => { search = ev.target.value; render(); });
+if (new URLSearchParams(location.search).get('chrome') === 'panel')
+  document.body.classList.add('panel-chrome');
 setInterval(syncIfIdle, 2000);
 refresh();
 </script>
