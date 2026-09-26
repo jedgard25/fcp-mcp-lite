@@ -4,14 +4,16 @@ Minimal agent bridge for Final Cut Pro. Extracts only the load-bearing core
 from [SpliceKit](https://github.com/elliotttate/SpliceKit) (MIT):
 
 - **patch** — copy App Store FCP, inject a dylib, re-sign, launch
-- **bridge** — ObjC dylib, TCP JSON-RPC on `127.0.0.1:9876`
+- **bridge** — ObjC dylib, TCP JSON-RPC on `127.0.0.1:9876`, plus an in-process
+  **Window > Transcript** panel (WKWebView on the `transcript-ui` service —
+  no Workflow Extension SDK / `.appex` needed because the dylib already
+  runs inside FCP)
 - **mcp** — stdio MCP server with story, word, silence, and timeline tools
 - **tools** — vendored `silence-detector.swift` + `parakeet-transcriber`, run as
   **subprocesses** (never in-process, so a crash can't take FCP down)
 
 Non-goals: command palette, plugins, mixer UI, captions UI, BRAW/VP9, debug
-toolkit, in-process transcript panel. All of that is SpliceKit upstream if you
-ever want it.
+toolkit. All of that is SpliceKit upstream if you ever want it.
 
 ## Layout
 
@@ -31,9 +33,13 @@ scripts/mcp-doctor.sh   venv + bridge reachability checks
 make mcp-setup    # venv at ~/.venvs/fcp-mcp-lite
 make patch        # patch + launch FCP (prompts before touching anything)
 make mcp-doctor   # verify venv + bridge on :9876
+make ui           # transcript service on :8765 (leave running)
 ```
 
 Then point opencode at the MCP server (see `mcp/client-config.json`).
+
+In patched FCP: **Window > Transcript** (⌘0) opens the editor panel. It shows
+bridge/MCP status until a transcript exists, then the cards.
 
 ## Design rules (why SpliceKit broke, and this won't)
 

@@ -1,19 +1,24 @@
 // FCPBridge.m — minimal agent bridge for Final Cut Pro.
 //
-// One file, ~500 lines, 7 verbs. Patterns adapted from SpliceKit (MIT):
+// One file, 7 verbs + one in-process Transcript panel. Patterns adapted from
+// SpliceKit (MIT):
 //   - NSApp.delegate -> activeEditorContainer -> timelineModule
 //   - sequence -> primaryObject -> containedItems (spine walk)
 //   - IBAction-style selectors on FFAnchoredTimelineModule with sender=nil
 //   - NSInvocation for struct (CMTime) returns — ABI-safe on arm64 + x86_64
 //   - TCP JSON-RPC 2.0 on 127.0.0.1:9876, newline-delimited
+//   - Window > Transcript (Cmd+0): in-process WKWebView panel on
+//     http://127.0.0.1:8765/ — no Workflow Extension SDK, no .appex, no
+//     /Applications install. Shows MCP status until transcribed (ui_server).
 //
-// Deliberately NOT included: runtime introspection, plugin loader, panels,
+// Deliberately NOT included: runtime introspection, plugin loader,
 // transcription, captions, debug toolkit. Brains live in mcp/server.py;
 // this file is dumb pipes with defensive respondsToSelector: checks.
 
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
 #import <CoreMedia/CoreMedia.h>
+#import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <sys/socket.h>
@@ -21,7 +26,7 @@
 #import <unistd.h>
 
 #define FCB_PORT 9876
-#define FCB_VERSION @"0.2.0"
+#define FCB_VERSION @"0.3.0"
 
 // Matches CMTime layout {value:int64, timescale:int32, flags:uint32, epoch:int64}.
 typedef struct { int64_t value; int32_t timescale; uint32_t flags; int64_t epoch; } FCB_CMTime;
@@ -1328,6 +1333,125 @@ static NSDictionary *FCB_undoRedo(BOOL isUndo) {
     return result;
 }
 
+// ---------------------------------------------------------------- panel
+// In-process Transcript panel: the clever shortcut around a Workflow
+// Extension. Because this dylib already runs inside FCP (see patch_fcp.sh),
+// a Window-menu item + WKWebView is all it takes — no Apple SDK download,
+// no Xcode .appex target, no /Applications install + pluginkit registration,
+// no sandbox network entitlement. FCP was re-signed with sandbox off, so
+// plain localhost HTTP to the ui_server works from here.
+//
+// Shows MCP status until transcribed: the page itself renders /api/status +
+// /api/editor edit_error. If make ui isn't running, a fallback page says so.
+
+static int FCB_uiPort(void) {
+    const char *e = getenv("TRANSCRIPT_UI_PORT");
+    if (e && e[0]) {
+        long p = strtol(e, NULL, 10);
+        if (p > 0 && p < 65536) return (int)p;
+    }
+    return 8765;
+}
+
+@interface FCBTranscriptController : NSObject <WKNavigationDelegate>
+@property (retain) NSWindow *window;
+@property (retain) WKWebView *web;
++ (instancetype)shared;
+- (void)openTranscript:(id)sender;
+- (void)reloadTranscript:(id)sender;
+@end
+
+@implementation FCBTranscriptController
+
++ (instancetype)shared {
+    static FCBTranscriptController *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [[self alloc] init]; });
+    return s;
+}
+
+- (NSURL *)serviceURL {
+    return [NSURL URLWithString:
+        [NSString stringWithFormat:@"http://127.0.0.1:%d/", FCB_uiPort()]];
+}
+
+- (void)openTranscript:(id)sender {
+    @try {
+        if (!self.window) {
+            NSRect frame = NSMakeRect(0, 0, 400, 760);
+            NSWindow *w = [[NSWindow alloc]
+                initWithContentRect:frame
+                styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                           NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable)
+                backing:NSBackingStoreBuffered defer:NO];
+            w.title = @"Transcript";
+            w.minSize = NSMakeSize(300, 400);
+            WKWebViewConfiguration *cfg = [[WKWebViewConfiguration alloc] init];
+            WKWebView *web = [[WKWebView alloc] initWithFrame:frame configuration:cfg];
+            web.navigationDelegate = self;
+            w.contentView = web;
+            [w center];
+            [w setFrameAutosaveName:@"FCPBridgeTranscript"];
+            self.web = web;
+            self.window = w;
+        }
+        [self.web loadRequest:[NSURLRequest requestWithURL:[self serviceURL]]];
+        [self.window makeKeyAndOrderFront:nil];
+    } @catch (NSException *e) {
+        FCB_LOG(@"transcript panel failed: %@", e.reason);
+    }
+}
+
+- (void)reloadTranscript:(id)sender {
+    [self openTranscript:sender];
+}
+
+// Service down (make ui not running): replace the WebKit error page with
+// actionable instructions + retry. Service up but no transcript is handled
+// by the page itself (edit_error banner).
+- (void)webView:(WKWebView *)webView
+    didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error {
+    NSString *html = [NSString stringWithFormat:
+        @"<body style='background:#0c0c0e;color:#c9c9cd;font:15px -apple-system,Helvetica,sans-serif;padding:40px 28px'>"
+         "<h2 style='font-size:16px'>Transcript service not running</h2>"
+         "<p>Start it, then retry:</p>"
+         "<pre style='background:#131316;padding:10px 12px;border-radius:8px'>make ui  # http://127.0.0.1:%d</pre>"
+         "<p style='color:#7a7a80'>Bridge %@ is up — this panel only needs the ui service. "
+         "Once words are transcribed the cards appear here automatically.</p>"
+         "<p><a href='http://127.0.0.1:%d/' style='color:#5ac8fa'>Retry</a></p></body>",
+        FCB_uiPort(), FCB_VERSION, FCB_uiPort()];
+    [webView loadHTMLString:html baseURL:nil];
+}
+
+- (void)webView:(WKWebView *)webView
+    didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error {
+    [self webView:webView didFailProvisionalNavigation:navigation withError:error];
+}
+
+@end
+
+static void FCB_installTranscriptMenu(void) {
+    NSMenu *main = [NSApp mainMenu];
+    if (!main) return;
+    NSMenuItem *windowItem = nil;
+    for (NSMenuItem *item in [main itemArray]) {
+        if ([[item title] isEqualToString:@"Window"]) { windowItem = item; break; }
+    }
+    NSMenu *host = windowItem ? [windowItem submenu] : main;
+    if (!host) return;
+    for (NSMenuItem *item in [host itemArray]) {
+        if ([[item title] isEqualToString:@"Transcript"]) return; // idempotent
+    }
+    if ([host numberOfItems] > 0) [host addItem:[NSMenuItem separatorItem]];
+    NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@"Transcript"
+        action:@selector(openTranscript:) keyEquivalent:@"0"];
+    item.target = [FCBTranscriptController shared];
+    item.keyEquivalentModifierMask = NSEventModifierFlagCommand;
+    item.toolTip = @"Open the transcript editor panel (needs `make ui` running)";
+    [host addItem:item];
+    FCB_LOG(@"Transcript panel installed (Window > Transcript)");
+}
+
 // ---------------------------------------------------------------- server
 
 static NSDictionary *FCB_dispatch(NSString *method, NSDictionary *params) {
@@ -1438,6 +1562,12 @@ static void FCB_init(void) {
             FCB_LOG(@"FCPBridge %@ loaded", FCB_VERSION);
             // Small delay so the app controller + libraries settle.
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
-                dispatch_get_main_queue(), ^{ FCB_startServer(); });
+                dispatch_get_main_queue(), ^{
+                    FCB_startServer();
+                    @try { FCB_installTranscriptMenu(); }
+                    @catch (NSException *e) {
+                        FCB_LOG(@"transcript menu install failed: %@", e.reason);
+                    }
+                });
         }];
 }
