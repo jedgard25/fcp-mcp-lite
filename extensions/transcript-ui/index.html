@@ -21,29 +21,24 @@
     --warn: #ffd60a;
   }
   * { box-sizing: border-box; }
+  html, body { height: 100%; }
   body {
     background: var(--bg); color: var(--txt);
     font: 13px/1.45 -apple-system, Helvetica, Arial, sans-serif;
-    margin: 0; padding: 0 0 8px;
+    margin: 0; padding: 0;
     -webkit-font-smoothing: antialiased;
+    display: flex; flex-direction: column; overflow: hidden;
   }
-  /* ---- header (FCP toolbar mood: dark bar, small title, search) ---- */
+  /* ---- top bar: search only (title row removed as redundant) ---- */
   header {
-    position: sticky; top: 0; z-index: 5;
+    flex: none;
     background: #2a2a2c; border-bottom: 1px solid #101012;
-    padding: 12px 16px 10px;
+    padding: 10px 12px;
   }
-  header .t { display: flex; align-items: baseline; gap: 8px; }
-  header h1 { font-size: 13px; font-weight: 600; margin: 0; }
-  header .sub {
-    font-size: 12px; color: var(--dim); white-space: nowrap;
-    overflow: hidden; text-overflow: ellipsis;
-  }
-  header .row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
   #search {
-    flex: 1; background: #101012; border: 1px solid var(--line);
+    width: 100%; background: #101012; border: 1px solid var(--line);
     border-radius: 8px; color: var(--txt); font: inherit;
-    padding: 5px 10px; outline: none; min-width: 0;
+    padding: 5px 10px; outline: none;
   }
   #search:focus { border-color: var(--acc); }
   #search::placeholder { color: var(--faint); }
@@ -56,6 +51,7 @@
   .iconbtn:disabled { opacity: .35; cursor: default; background: none; }
   /* ---- status strip: one quiet line, like an inspector footnote ---- */
   #status {
+    flex: none;
     display: flex; align-items: center; gap: 7px;
     padding: 7px 16px; font-size: 12px; color: var(--dim);
     border-bottom: 1px solid var(--line);
@@ -65,7 +61,7 @@
   #status.warn .dot { background: var(--warn); }
   #status .msg { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   /* ---- banners ---- */
-  #err, #note { display: none; margin: 10px 12px 0; padding: 8px 12px; font-size: 12px; }
+  #err, #note { display: none; margin: 10px 12px 0; padding: 8px 12px; font-size: 12px; flex: none; }
   #err {
     display: none; border-radius: 8px; background: #2a1214; color: #ff9d97;
     border: 1px solid #5a2c2c; white-space: pre-wrap;
@@ -74,8 +70,25 @@
     border-radius: 8px; background: var(--acc-soft); color: #c7c5ff;
     border: 1px solid rgba(94, 92, 230, .4);
   }
-  /* ---- cards as inspector sections ---- */
-  #list { list-style: none; margin: 0; padding: 0; }
+  /* ---- cards as inspector sections, scrolling in their own region ---- */
+  #list {
+    list-style: none; margin: 0; padding: 0;
+    flex: 1 1 auto; min-height: 0; overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, .16) transparent;
+  }
+  /* Minimal floating-style thumb nested inside the list (not the window edge).
+     True auto-hide follows the macOS "Show scroll bars" setting; this keeps
+     the thumb as quiet as CSS allows until hover. */
+  #list::-webkit-scrollbar { width: 10px; }
+  #list::-webkit-scrollbar-track { background: transparent; }
+  #list::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, .14);
+    border-radius: 5px;
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+  #list::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, .28); background-clip: content-box; border: 3px solid transparent; }
   #list li {
     background: var(--row); border-bottom: 1px solid #101012;
     margin: 0; padding: 0;
@@ -111,7 +124,10 @@
   .cardbody:focus { border-color: var(--acc); box-shadow: 0 0 0 1px var(--acc); }
   .cardbody.locked { opacity: .6; }
   /* ---- waiting view ---- */
-  #waiting { display: none; text-align: center; padding: 56px 28px; color: var(--dim); }
+  #waiting {
+    display: none; flex: 1 1 auto; min-height: 0; overflow-y: auto;
+    text-align: center; padding: 56px 28px; color: var(--dim);
+  }
   #waiting .glyph { font-size: 34px; margin-bottom: 12px; }
   #waiting h2 { font-size: 13px; font-weight: 600; color: var(--txt); margin: 0 0 6px; }
   #waiting p { font-size: 12px; margin: 4px 0; }
@@ -120,21 +136,20 @@
     border-radius: 6px; padding: 2px 8px; font-size: 12px; color: var(--txt);
   }
   footer {
-    position: sticky; bottom: 0; background: #2a2a2c; border-top: 1px solid #101012;
-    color: var(--faint); font-size: 11px; padding: 8px 16px;
-    display: flex; gap: 8px; align-items: center; margin-top: 8px;
+    flex: none;
+    background: #2a2a2c; border-top: 1px solid #101012;
+    color: var(--faint); font-size: 11px; padding: 6px 8px 6px 16px;
+    display: flex; gap: 8px; align-items: center;
   }
   footer .keys { margin-left: auto; white-space: nowrap; }
+  footer .iconbtn {
+    font-size: 13px; padding: 3px 8px; margin-left: 2px;
+    color: var(--faint);
+  }
+  footer .iconbtn:hover { color: var(--txt); background: #38383a; }
 </style>
 <header>
-  <div class="t">
-    <h1>Transcript</h1>
-    <span class="sub" id="timeline">Final Cut Pro</span>
-  </div>
-  <div class="row">
-    <input id="search" type="search" placeholder="Search transcript" autocomplete="off">
-    <button class="iconbtn" id="refresh" title="Refresh from Final Cut Pro (⌘R)">↻</button>
-  </div>
+  <input id="search" type="search" placeholder="Search transcript" autocomplete="off">
 </header>
 <div id="status"><span class="dot"></span><span class="msg" id="statusmsg">Connecting…</span></div>
 <div id="err"></div>
@@ -146,7 +161,7 @@
   <p>Service: <code>make ui</code> · panel: <code>Window &gt; Transcript</code></p>
 </div>
 <ol id="list"></ol>
-<footer><span id="counts"></span><span class="keys">↵ split&ensp;·&ensp;⌫ trim&ensp;·&ensp;drag to reorder</span></footer>
+<footer><span id="counts"></span><span class="keys">↵ split&ensp;·&ensp;⌫ trim&ensp;·&ensp;drag to reorder</span><button class="iconbtn" id="refresh" title="Refresh from Final Cut Pro (⌘R)">↻</button></footer>
 <script>
 'use strict';
 /* Slice-model editor (the one clean path): GET /api/editor snapshot,
@@ -365,7 +380,6 @@ function wordAfterCaret(editable) {
 
 /* ---- render ---- */
 function render() {
-  $('#timeline').textContent = (snap && snap.title) || 'Final Cut Pro';
   list.innerHTML = '';
   const showWaiting = !snap;
   waiting.style.display = showWaiting ? 'block' : 'none';
