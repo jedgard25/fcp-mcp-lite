@@ -1379,13 +1379,23 @@ static int FCB_uiPort(void) {
     @try {
         if (!self.window) {
             NSRect frame = NSMakeRect(0, 0, 400, 760);
-            NSWindow *w = [[NSWindow alloc]
+            // Floating NSPanel (not a plain NSWindow): stays ordered above
+            // FCP's normal windows when focus returns to the editor, stays
+            // visible across app switches, still takes keyboard focus for
+            // editing. This is the plugin-like behavior — plain AppKit, no
+            // FCP-private hook required.
+            NSPanel *w = [[NSPanel alloc]
                 initWithContentRect:frame
                 styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                            NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable)
                 backing:NSBackingStoreBuffered defer:NO];
             w.title = @"Transcript";
             w.minSize = NSMakeSize(300, 400);
+            w.floatingPanel = YES;
+            w.hidesOnDeactivate = NO;
+            w.level = NSFloatingWindowLevel;
+            w.collectionBehavior |= NSWindowCollectionBehaviorFullScreenAuxiliary;
+            w.releasedWhenClosed = NO;
             WKWebViewConfiguration *cfg = [[WKWebViewConfiguration alloc] init];
             WKWebView *web = [[WKWebView alloc] initWithFrame:frame configuration:cfg];
             web.navigationDelegate = self;
