@@ -6,11 +6,9 @@ Lightweight MCP server for Final Cut Pro: **transcribe, cut, audit**. It drives 
 patched FCP over a local JSON-RPC bridge — no Workflow Extension SDK, no
 `.appex`, no private framework linking beyond the dylib the patcher injects.
 
-It is a rewrite built on [SpliceKit](https://github.com/elliotttate/SpliceKit)
-(MIT): SpliceKit was both a dependency and the reference base, and its
-copy-→-inject-→-re-sign approach and bridge patterns are the starting point
-here. Only the load-bearing core is kept. Command palette, plugin framework,
-mixer/captions UI, BRAW/VP9 and the debug toolkit are deliberate non-goals.
+It is a small rewrite built on [SpliceKit](https://github.com/elliotttate/SpliceKit)
+(MIT) — its copy-→-inject-→-re-sign approach and bridge patterns were the
+starting point, and only the load-bearing core was kept.
 
 ## Components
 
@@ -110,10 +108,11 @@ code. The core (`patch/` + `bridge/` + `mcp/`) is ~4,500 lines; `extensions/`
 and `tests/` make up the rest. It's small enough to read top to bottom, and it
 is meant to stay that way.
 
-This is deliberately a minimal MCP. The command palette, plugin framework,
-mixer/captions UI, BRAW/VP9 and debug toolkit are non-goals (they live upstream
-in SpliceKit). If you want to extend it, fork it or open a PR — keep the core
-lean and dependency-free, and put optional surface under `extensions/`.
+This is deliberately a minimal MCP. The goal isn't a pile of niche features —
+it's to find the best *shape* for agent editing workflows: the right harness of
+operations that compose, from editing through testing and auditing, rather than
+one-offs. To help find that shape, fork it or open a PR — keep the core lean and
+dependency-free, and put optional surface under `extensions/`.
 
 ## Known v0 limits
 
