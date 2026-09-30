@@ -102,6 +102,19 @@ status until a transcript exists, then the cards. The panel loads the same page
 as http://127.0.0.1:8765 and edits commit immediately through the same
 validation and log as the agent verbs.
 
+## Size & contributing
+
+About **7,800 lines** of tracked source — and roughly 1,000 of those are the
+vendored `silence-detector.swift` and Parakeet transcriber, not this project's
+code. The core (`patch/` + `bridge/` + `mcp/`) is ~4,500 lines; `extensions/`
+and `tests/` make up the rest. It's small enough to read top to bottom, and it
+is meant to stay that way.
+
+This is deliberately a minimal MCP. The command palette, plugin framework,
+mixer/captions UI, BRAW/VP9 and debug toolkit are non-goals (they live upstream
+in SpliceKit). If you want to extend it, fork it or open a PR — keep the core
+lean and dependency-free, and put optional surface under `extensions/`.
+
 ## Known v0 limits
 
 - A batch is **N undo entries**, not one (`undo_steps` counts issued actions;
