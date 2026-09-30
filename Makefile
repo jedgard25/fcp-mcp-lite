@@ -11,6 +11,7 @@ test:
 	$(VENV)/bin/python tests/test_story.py
 	$(VENV)/bin/python tests/test_lineops.py
 	$(VENV)/bin/python tests/test_editor.py
+	$(VENV)/bin/python tests/test_verbatim.py
 
 mcp-setup:
 	python3 -m venv $(VENV)

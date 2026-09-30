@@ -42,12 +42,15 @@ REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # is talking to the latest checkout. (The injected dylib carries its own
 # FCB_VERSION in bridge/FCPBridge.m — the two versions are independent
 # and reported side-by-side.)
-__version__ = "0.5.4"
+__version__ = "0.5.5"
 DEFAULT_CUT_PIECES = 40
 # Transcript-cache schema. Bumped on any words/cache layout change; the key
 # AND the payload both carry it, so an upgrade never dead-ends on a stale
 # cache hit ("safe to reuse but not when our schema changes").
-SCHEMA_VERSION = 3
+# v4 adds additive verbatim enrichment (filler/repeat word flags, see
+# VERBATIM_FILLERS): v3 caches migrate in place via _ensure_word_tags
+# instead of forcing a re-transcribe.
+SCHEMA_VERSION = 4
 SILENCE_BIN = ["swift", os.path.join(REPO_DIR, "tools", "silence-detector.swift")]
 PARAKEET_BIN = os.path.join(
     REPO_DIR, "tools", "parakeet-transcriber", ".build", "release", "parakeet-transcriber"
@@ -673,6 +676,139 @@ FILLER_WORDS = frozenset({
     "and", "but", "so-", "i", "i-", "let", "lets", "let's",
 })
 
+# ---------------------------------------------------------------- verbatim
+# Unified verbatim enrichment (single engine, single schema — no ASR fork).
+#
+# Adaptation of the verbatim-cut insight (verbatim transcript + gap events
+# + filler/repeat tags): Parakeet stays the only ASR, so there is exactly
+# one timestamp behavior and one cut routing. These pure-Python taggers run
+# on cached words at transcribe time and backfill older caches on load.
+# A second ASR engine (faster-whisper verbatim) is deliberately NOT added:
+# it would fork timestamp bias, cache keys, and the test matrix for fillers
+# Parakeet already drops (unrecoverable post-hoc anyway).
+#
+# Words carry optional additive flags (absent == False, so v3-era tests and
+# hand-built caches keep working):
+#   filler: word matches the filler list (may still be content — "like")
+#   repeat: first take of an immediately repeated word/phrase ("I I think")
+VERBATIM_FILLERS = (
+    "um,umm,uh,uhh,erm,er,ah,hmm,mm,mhm,like,you know,i mean,sort of,kind of"
+)
+VERBATIM_MIN_GAP_S = 0.15  # gaps shorter than this are not events
+
+
+def _norm_token(t: str) -> str:
+    return re.sub(r"[^a-z0-9' ]", "", (t or "").lower()).strip()
+
+
+def _tag_filler_words(words: list, fillers: str = VERBATIM_FILLERS) -> int:
+    """Mark filler words in place. Returns the count newly flagged.
+
+    Multi-word fillers ("you know", "i mean", "sort of") match consecutive
+    words. Single-word entries match one word. Idempotent.
+    """
+    seqs = [s for s in (_norm_token(x).split() for x in fillers.split(",")) if s]
+    if not seqs or not words:
+        return 0
+    norms = [_norm_token(w.get("w", "")) for w in words]
+    changed = 0
+    i = 0
+    while i < len(words):
+        for f in sorted(seqs, key=len, reverse=True):
+            n = len(f)
+            if " ".join(norms[i:i + n]) == " ".join(f) and norms[i:i + n]:
+                for w in words[i:i + n]:
+                    if not w.get("filler"):
+                        w["filler"] = True
+                        changed += 1
+                i += n - 1
+                break
+        i += 1
+    return changed
+
+
+def _tag_repeat_words(words: list, max_n: int = 3, window_s: float = 2.0) -> int:
+    """Mark the first take of immediately repeated words/phrases in place.
+
+    If words[i:i+n] == words[i+n:i+2n] within window_s, the first copy gets
+    repeat=True (the second take is usually the clean one). Idempotent.
+    Returns the count of words newly flagged.
+    """
+    if not words:
+        return 0
+    norms = [_norm_token(w.get("w", "")) for w in words]
+    changed = 0
+    for n in range(max_n, 0, -1):
+        for i in range(len(words) - 2 * n + 1):
+            a, b = words[i:i + n], words[i + n:i + 2 * n]
+            if any(t.get("repeat") for t in a + b):
+                continue
+            try:
+                if ([norms[i + k] for k in range(n)]
+                        == [norms[i + n + k] for k in range(n)]
+                        and all(norms[i + k] for k in range(n))
+                        and float(b[-1]["f_end"]) - float(a[0]["f_start"]) <= window_s):
+                    for t in a:
+                        if not t.get("repeat"):
+                            t["repeat"] = True
+                            changed += 1
+            except (KeyError, TypeError, ValueError):
+                continue
+    return changed
+
+
+def _ensure_word_tags(words: list) -> bool:
+    """Backfill filler/repeat flags on a loaded cache. Returns True if changed."""
+    if not words or "f_start" not in words[0]:
+        return False
+    before = sum(1 for w in words if w.get("filler") or w.get("repeat"))
+    _tag_filler_words(words)
+    _tag_repeat_words(words)
+    return sum(1 for w in words if w.get("filler") or w.get("repeat")) != before
+
+
+def _word_gaps(words: list, min_gap_s: float = VERBATIM_MIN_GAP_S) -> list:
+    """Inter-word gaps (FILE seconds) longer than min_gap_s — pure, no I/O.
+
+    Every word has f_start/f_end, so every gap is a candidate event (the
+    verbatim-cut trick). Energy labeling happens separately in
+    _label_gaps_with_silences, which needs a detector run; reads use the
+    unlabeled gap (kind="gap") so they never spawn engines.
+    """
+    out = []
+    for a, b in zip(words, words[1:]):
+        try:
+            gs, ge = float(a["f_end"]), float(b["f_start"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if ge - gs >= min_gap_s:
+            out.append({"f_start": round(gs, 3), "f_end": round(ge, 3),
+                        "dur_s": round(ge - gs, 3), "kind": "gap"})
+    return out
+
+
+def _label_gaps_with_silences(gaps: list, file_silences: list) -> list:
+    """Label file-space gaps as silence vs noise using detector ranges.
+
+    file_silences: [{"start","duration"}] in FILE seconds (the detector's
+    native space). A gap fully covered by a silent range is "silence";
+    a gap with sound but no word is "noise" (breath, laugh, dropped
+    filler, room noise — deliberately not sub-classified). Pure function.
+    """
+    sil = []
+    for r in file_silences or []:
+        try:
+            s = float(r["start"])
+            sil.append((s, s + float(r["duration"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    labeled = []
+    for g in gaps:
+        gs, ge = float(g["f_start"]), float(g["f_end"])
+        covered = any(s <= gs + 1e-6 and ge <= e + 1e-6 for s, e in sil)
+        labeled.append({**g, "kind": "silence" if covered else "noise"})
+    return labeled
+
 
 def _collapse_silence_islands(spans: list, rpc, max_island_s: float) -> tuple:
     """Merge cut spans across tiny kept islands (breath / false-start slop).
@@ -695,7 +831,8 @@ def _collapse_silence_islands(spans: list, rpc, max_island_s: float) -> tuple:
         try:
             atom.append((float(w["f_start"]), float(w["f_end"]),
                          str(w.get("w", "")).strip().strip(",.?!…'\"").lower(),
-                         float(w.get("confidence", 1.0) or 0.0)))
+                         float(w.get("confidence", 1.0) or 0.0),
+                         bool(w.get("filler")), bool(w.get("repeat"))))
         except (KeyError, TypeError, ValueError):
             continue
     try:
@@ -728,15 +865,20 @@ def _collapse_silence_islands(spans: list, rpc, max_island_s: float) -> tuple:
                 continue
             f0, _ = _clip_file_window(c)
             fa, fb = f0 + (lo - tb), f0 + (hi - tb)
-            for fs, fe, wl, conf in atom:
-                if fe > fa and fs < fb and (wl, conf) not in gap_words:
-                    gap_words.append((wl, conf))
+            for fs, fe, wl, conf, is_filler, is_repeat in atom:
+                if fe > fa and fs < fb and (wl, conf) not in [(w, c) for w, c, _, _ in gap_words]:
+                    gap_words.append((wl, conf, is_filler, is_repeat))
         if not gap_words:
             reason = "no transcribed words (breath/noise)"
             absorb = True
         elif (len(gap_words) <= 4
-                and all(w in FILLER_WORDS or cf < 0.7 for w, cf in gap_words)):
-            reason = f"false-start filler ({' '.join(w for w, _ in gap_words)[:60]})"
+                and all(w in FILLER_WORDS or fl or rp or cf < 0.7
+                        for w, cf, fl, rp in gap_words)):
+            tagged = [w for w, _, fl, rp in gap_words if fl or rp]
+            if tagged:
+                reason = f"false-start filler ({' '.join(tagged)[:60]})"
+            else:
+                reason = f"false-start filler ({' '.join(w for w, _, _, _ in gap_words)[:60]})"
             absorb = True
         else:
             absorb = False
@@ -745,7 +887,7 @@ def _collapse_silence_islands(spans: list, rpc, max_island_s: float) -> tuple:
             collapsed += 1
             details.append({"gap_start": cur_b, "gap_end": next_a,
                             "gap_s": gap,
-                            "words": [w for w, _ in gap_words],
+                            "words": [w for w, _, _, _ in gap_words],
                             "reason": reason})
         else:
             out.append([next_a, next_b])
@@ -810,6 +952,9 @@ def _silence_scan(rpc, threshold_db: float, min_duration_s: float, for_cut: bool
     eats word onsets/offsets (132/169 spans overlapped words). for_cut on
     a degenerate trim layout raises instead of mapping fiction (see
     _trim_health). Returns (spans, per_file) with spans merged timeline seconds.
+    Each per_file entry also carries gap_events: inter-word gaps from the
+    cached transcript (when it covers this file) labeled silence vs noise
+    against this same detector run — no extra subprocess, no new routing.
     """
     clips = _all_existing_clips(rpc)
     if for_cut:
@@ -868,6 +1013,18 @@ def _silence_scan(rpc, threshold_db: float, min_duration_s: float, for_cut: bool
         entry = {"file": path, "clips": len(fclips), "mapped_hits": mapped}
         if for_cut and guarded_hits:
             entry["word_guarded"] = guarded_hits
+        try:
+            t = _last_transcript()
+        except Exception:
+            t = None
+        if t and t.get("media_path") == path and t.get("words"):
+            gaps = _word_gaps(t["words"])
+            labeled = _label_gaps_with_silences(gaps, res.get("silentRanges", []))
+            counts: dict = {}
+            for g in labeled:
+                counts[g["kind"]] = counts.get(g["kind"], 0) + 1
+            entry["gap_events"] = labeled
+            entry["gap_counts"] = counts
         per_file.append(entry)
     return _merge_spans(spans), per_file
 
@@ -902,6 +1059,8 @@ def detect_silences(
     per unique source), mapped to timeline seconds. threshold_db=-34 ≈
     'auto' sensitivity floor. Per-file `mapped_hits` counts pre-merge
     detections; `count` is post-merge spans (merged <= mapped, always).
+    Per-file entries also carry `gap_events` (inter-word gaps labeled
+    silence vs noise against the same detector run) and `gap_counts`.
     """
     args = {"threshold_db": threshold_db, "min_duration_s": min_duration_s, "pad_s": pad_s}
 
@@ -1126,14 +1285,19 @@ def _story_fragments(cache_words: list, max_words: int = 40) -> list:
 
     def flush():
         if cur:
-            out.append({
+            frag = {
                 "id": f"L{cur[0]['i']:04d}",
                 "start_word": cur[0]["i"],
                 "end_word": cur[-1]["i"],
                 "text": " ".join(w["w"] for w in cur),
                 "f_start": float(cur[0]["f_start"]),
                 "f_end": float(cur[-1]["f_end"]),
-            })
+            }
+            if any(w.get("filler") for w in cur):
+                frag["has_filler"] = True
+            if any(w.get("repeat") for w in cur):
+                frag["has_repeat"] = True
+            out.append(frag)
             cur.clear()
 
     for w in cache_words:
@@ -1447,9 +1611,23 @@ def _load_cache(key: str) -> dict | None:
     if os.path.exists(p):
         with open(p) as f:
             data = json.load(f)
-        if data.get("schema") != SCHEMA_VERSION:
-            return None  # stale schema: cache MISS (forces re-transcribe, never dead-ends)
-        return data
+        if data.get("schema") == SCHEMA_VERSION:
+            return data
+        # v3 -> v4: additive filler/repeat flags only. Backfill in place
+        # instead of forcing a re-transcribe; anything older is a real MISS.
+        if data.get("schema") == SCHEMA_VERSION - 1 and data.get("words"):
+            w0 = data["words"][0] if data["words"] else {}
+            if "f_start" not in w0 or not data.get("media_path"):
+                return None
+            _ensure_word_tags(data["words"])
+            data["schema"] = SCHEMA_VERSION
+            try:
+                with open(p, "w") as f:
+                    json.dump(data, f)
+            except OSError:
+                pass
+            return data
+        return None  # stale schema: cache MISS (forces re-transcribe, never dead-ends)
     return None
 
 
@@ -1514,6 +1692,8 @@ def transcribe(engine: str = "parakeet", model: str = "v3") -> dict:
             # Cache hit: re-resolve live positions (timeline may have
             # rippled since the transcribe) and re-stamp the duration, so
             # the guard can never dead-end after a cut (Bug 1 fix).
+            if _ensure_word_tags(cached.get("words", [])):
+                pass  # v3-era cache backfilled in memory; re-saved below
             try:
                 live, missing = _words_with_live_times(rpc, cached)
             except BridgeError as e:
@@ -1524,11 +1704,16 @@ def transcribe(engine: str = "parakeet", model: str = "v3") -> dict:
             _save_cache(key, cached)
             # Sentence preview rebuilt from live positions (removed words excluded).
             preview = _sentences([w for w in live if not w.get("removed")])
-            return {"cached": True, "clip": clip["name"],
-                    "word_count": len(live),
-                    "sentence_count": len(preview), "sentences": preview[:8],
-                    "removed_words": missing,
-                    "note": "preview only — read the full transcript as stable lines with get_story (compact)"}
+            out = {"cached": True, "clip": clip["name"],
+                   "word_count": len(live),
+                   "sentence_count": len(preview), "sentences": preview[:8],
+                   "removed_words": missing,
+                   "note": "preview only — read the full transcript as stable lines with get_story (compact)"}
+            nf = sum(1 for w in cached.get("words", []) if w.get("filler"))
+            nr = sum(1 for w in cached.get("words", []) if w.get("repeat"))
+            if nf or nr:
+                out["verbatim_tags"] = {"filler": nf, "repeat": nr}
+            return out
         words = json.loads(_run([PARAKEET_BIN, clip["media_path"], "--model", model], timeout=1800))
         # Store FILE times (immutable) + timeline times (preview, re-resolved live later).
         mapped = []
@@ -1540,15 +1725,22 @@ def transcribe(engine: str = "parakeet", model: str = "v3") -> dict:
                            "t_end": round(_file_to_timeline(clip, fe), 3),
                            "confidence": w.get("confidence"),
                            "speaker": w.get("speaker")})
+        _tag_filler_words(mapped)
+        _tag_repeat_words(mapped)
         data = {"clip": clip["name"], "media_path": clip["media_path"], "words": mapped,
                 "sentences": _sentences(mapped),
                 "timeline_duration_s": _clips(rpc).get("duration_s", 0),
                 "speakers": sorted({w["speaker"] for w in mapped if w.get("speaker")})}
         _save_cache(key, data)
-        return {"cached": False, "clip": clip["name"], "word_count": len(mapped),
-                "sentence_count": len(data["sentences"]),
-                "sentences": data["sentences"][:8],
-                "note": "first 8 sentences shown; read the full transcript as stable lines with get_story (compact)"}
+        out = {"cached": False, "clip": clip["name"], "word_count": len(mapped),
+               "sentence_count": len(data["sentences"]),
+               "sentences": data["sentences"][:8],
+               "note": "first 8 sentences shown; read the full transcript as stable lines with get_story (compact)"}
+        nf = sum(1 for w in mapped if w.get("filler"))
+        nr = sum(1 for w in mapped if w.get("repeat"))
+        if nf or nr:
+            out["verbatim_tags"] = {"filler": nf, "repeat": nr}
+        return out
 
     return logged("transcribe", args, run)
 
@@ -1585,7 +1777,8 @@ def get_transcript(search: str | None = None, limit: int = 200,
             if search:
                 s = search.lower()
                 rows = [w for w in rows if s in w.get("w", "").lower()]
-            rows = [{k: v for k, v in w.items() if v is not None}
+            rows = [{k: v for k, v in w.items()
+                     if v is not None and v is not False}
                     for w in rows[: max(1, limit)]]
             return {"clip": t.get("clip"), "word_count": len(words),
                     "removed_words": missing, "words": rows, **extra}
@@ -1927,7 +2120,8 @@ def get_story(search: str | None = None, limit: int = 200, offset: int = 0,
 
     detail='compact' (default): id + text only (~10 tok/line — no times,
     no word indices). detail='full': adds word ranges, file/live times,
-    take_group, removed flags. Ids (L0020) are file-anchored and never
+    take_group, removed flags, has_filler/has_repeat (verbatim word tags —
+    only present when true). Ids (L0020) are file-anchored and never
     shift after cuts — plan with these, commit with delete_lines /
     move_line / choose_takes. Resolved take groups hide by default.
     Never spawns an engine.
