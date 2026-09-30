@@ -114,8 +114,13 @@ operations that compose, from editing through testing and auditing, rather than
 one-offs. To help find that shape, fork it or open a PR — keep the core lean and
 dependency-free, and put optional surface under `extensions/`.
 
-## Known v0 limits
+## Limitations
 
+- **No multi-track or higher-level shape.** The model works clip-by-clip on the
+  primary storyline: there's no representation of nested sequences, connected
+  audio/B-roll, or the edit as a single object to reason over. Finding the right
+  shape for that is the hard, open problem — these verbs are a bet, not a
+  settled answer.
 - A batch is **N undo entries**, not one (`undo_steps` counts issued actions;
   inspect before a bulk undo).
 - Cuts are capped at 40 primary-clip pieces per call by default and return
@@ -124,3 +129,11 @@ dependency-free, and put optional surface under `extensions/`.
   word/silence ops are file-anchored and re-resolve against the live timeline.
 - Single-user assumed; cut targeting is primary-storyline-first, so connected
   timelines often miss (guarded — never wrong).
+
+## Next steps
+
+- **Give the model eyes.** Today it reasons over times and word indices and
+  never sees a frame. A likely direction is a Remotion-style *film sheet*: for
+  each cut, a video thumbnail beside a waveform strip, rendered into one image
+  the model can actually look at. That closes the gap between editing by number
+  and editing by what the cut looks like.
