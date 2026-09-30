@@ -1662,6 +1662,63 @@ def _fresh_transcript(rpc=None) -> dict:
     return t
 
 
+def _live_media_paths(rpc) -> set:
+    """Source files currently carried by an on-disk primary clip."""
+    try:
+        return {c["media_path"] for c in _all_existing_clips(rpc)}
+    except BridgeError:
+        return set()
+
+
+def _cached_transcript_for(media: set) -> tuple:
+    """Newest cached transcript whose source file is in `media`."""
+    if not media or not os.path.isdir(CACHE_DIR):
+        return None, None
+    best = None
+    for name in os.listdir(CACHE_DIR):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(CACHE_DIR, name)
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            mtime = os.path.getmtime(path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("words") and data.get("media_path") in media:
+            if best is None or mtime > best[0]:
+                best = (mtime, name[:-5], data)
+    return (best[1], best[2]) if best else (None, None)
+
+
+def _transcript_for_timeline(rpc) -> dict:
+    """Transcript that actually matches the clips on the timeline.
+
+    The last-transcript pointer goes stale when the timeline is rebuilt
+    around different media (a fresh sequence, re-linked audio): the editor
+    then resolves zero slices and the panel looks empty with no reason
+    shown (the "doesn't repopulate on reopen" symptom). Prefer the newest
+    cached transcript for a live clip, persist that choice, and only then
+    admit there is nothing to show — never render false silence.
+    """
+    t = _fresh_transcript(rpc)
+    media = _live_media_paths(rpc)
+    if not media or t.get("media_path") in media:
+        return t
+    key, data = _cached_transcript_for(media)
+    if key:
+        _ensure_word_tags(data.get("words", []))
+        try:
+            with open(STATE_PATH, "w") as f:
+                json.dump({"last_key": key}, f)
+        except OSError:
+            pass
+        return data
+    raise BridgeError(
+        f"the cached transcript is for {os.path.basename(t.get('media_path', '?'))}, "
+        "which is not on this timeline — run transcribe for the current clip")
+
+
 @mcp.tool()
 def transcribe(engine: str = "parakeet", model: str = "v3") -> dict:
     """Transcribe the first primary clip via on-device Parakeet subprocess.

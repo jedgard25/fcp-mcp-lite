@@ -13,7 +13,7 @@ LOCK = threading.RLock()
 
 
 def snapshot(rpc):
-    transcript = core._fresh_transcript(rpc)
+    transcript = core._transcript_for_timeline(rpc)
     state = core._clips(rpc)
     clips = sorted(core._primary_clips(state), key=lambda c: c.get("timeline_start_s", 0))
     media = transcript.get("media_path")
