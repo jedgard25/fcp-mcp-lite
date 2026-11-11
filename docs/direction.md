@@ -84,6 +84,7 @@ Layers, bottom up:
 |---|---|---|---|
 | **Composite frames** | "what does the viewer show at t?" | seek → `FFDestVideoDisplay _copyPlayerFrameForTime:` → `FFPlayerFrame.image1` (`FFImage`) → `newCGImageRef` | ~330 ms/frame, viewer quality (1080p at "better performance") |
 | **Cut sheet** | "is this cut clean, is this the right take?" | from `export_xml`: source path + in/out per slice → ffmpeg frames at head/tail + `showwavespic` with handles and edit lines (`tools/cut_sheet.py`) | ~0.7 s/cut, never touches FCP |
+| **Story check** | "does any line play twice, did a retake word survive a cut?" | kept transcript in timeline order from each clip's connected-audio range → near-duplicate sentences + same-word-across-cut (`tools/story_check.py`) | instant; caught 3 real defects in the first blind run that the visual audit missed |
 | **Timeline screenshot** | "what's placed where, what's disabled, what did I forget?" | in-process `cacheDisplayInRect:` of FCP's own window/timeline view: no TCC, because it is FCP drawing itself | ~100 ms |
 
 Planned: contact sheets of composite frames (N frames per slice, with lane
