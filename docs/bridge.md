@@ -17,6 +17,7 @@ surface; the target verb set (`export_xml`, `paste_xml`, `batch_begin/end`,
 | `timeline.action` | `{action}` | allowlist: `blade bladeAll delete cut copy paste selectClipAtPlayhead selectAll deselectAll addMarker addChapterMarker nextEdit previousEdit trimToPlayhead openCompound timelineBack` → `action:` selector on the timeline module, sender=nil. Step-in recipe: `timeline.select {id of container}` then `openCompound`; step-out: `timelineBack` |
 | `playback.position` | — | `{ t_s, fps, duration_s }` |
 | `dev.probe` | `{path, args}` | Development only; enabled when `FCB_DEV_PROBE` is set or `~/.fcpbridge-dev-probe` exists. `dlopen`s a probe dylib (use a unique path per build, because dyld caches by path) and runs its `NSDictionary *FCBProbe(NSDictionary *)` on the main thread with exceptions caught. Harness: `tools/probe/run.py tools/probe/recipes/<recipe>.m '{json}'`; the recipes are the working reference for each discovered call |
+| `groups.refresh` | `{enabled?}` | Redraws the timeline so clip **group colors** apply (`fcpmcp:group=<Name>:<paletteIndex>` in a clip's note colors that clip and its connected audio; untagged clips keep role colors). `enabled:false` turns the coloring off. The hook (`+[FFColorForRole colorSchemeForRolesOfObject:]` replacement) installs at launch. Returns `{installed, enabled, reloaded}` |
 | `playback.seek` | `{t_s}` | `{ t_s, status }` via `setPlayheadTime:` (600 kHz CMTime) |
 
 Cut planning, silence detection, transcription and verification live in

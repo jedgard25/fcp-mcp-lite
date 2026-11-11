@@ -26,7 +26,7 @@
 #import <unistd.h>
 
 #define FCB_PORT 9876
-#define FCB_VERSION @"0.3.0"
+#define FCB_VERSION @"0.4.0"
 
 // Matches CMTime layout {value:int64, timescale:int32, flags:uint32, epoch:int64}.
 typedef struct { int64_t value; int32_t timescale; uint32_t flags; int64_t epoch; } FCB_CMTime;
@@ -1463,6 +1463,74 @@ static void FCB_installTranscriptMenu(void) {
 }
 
 
+
+// ---------------------------------------------------------------- group colors
+// Color timeline clips (video + connected audio, compounds) by a group tag in the
+// clip note, independent of roles: `fcpmcp:group=<Name>:<paletteIndex>`.
+// Replaces +[FFColorForRole colorSchemeForRolesOfObject:] (and the
+// usingVideoRolesWhenExpanded: variant), which every timeline item asks for its
+// color; walks object -> -container (max 4 hops) via -[FFAnchoredObject
+// metadataNotes]; returns +colorSchemeForIndex: (FCP's own palette) or falls
+// through to the original. Untagged clips are untouched. Installed at launch.
+static IMP sGrpOrigA, sGrpOrigB, sGrpOrigIdx;
+static BOOL sGrpEnabled = YES, sGrpInstalled = NO;
+static NSRegularExpression *sGrpRe;
+
+static id FCB_groupScheme(id obj) {
+    if (!sGrpEnabled || !obj) return nil;
+    SEL notesSel = NSSelectorFromString(@"metadataNotes"), contSel = NSSelectorFromString(@"container");
+    id o = obj;
+    for (int hop = 0; o && hop < 4; hop++) {
+        if ([o respondsToSelector:notesSel]) {
+            id n = ((id (*)(id, SEL))objc_msgSend)(o, notesSel);
+            if ([n isKindOfClass:[NSString class]] && [(NSString *)n rangeOfString:@"fcpmcp:group="].location != NSNotFound) {
+                NSTextCheckingResult *m = [sGrpRe firstMatchInString:n options:0 range:NSMakeRange(0, [(NSString *)n length])];
+                if (m) {
+                    long idx = [[(NSString *)n substringWithRange:[m rangeAtIndex:1]] integerValue];
+                    return ((id (*)(id, SEL, long))sGrpOrigIdx)((id)objc_getClass("FFColorForRole"),
+                                                                NSSelectorFromString(@"colorSchemeForIndex:"), idx);
+                }
+            }
+        }
+        if (![o respondsToSelector:contSel]) break;
+        o = ((id (*)(id, SEL))objc_msgSend)(o, contSel);
+    }
+    return nil;
+}
+static id FCB_grpHookA(id self, SEL _cmd, id obj) {
+    id s = FCB_groupScheme(obj);
+    return s ?: ((id (*)(id, SEL, id))sGrpOrigA)(self, _cmd, obj);
+}
+static id FCB_grpHookB(id self, SEL _cmd, id obj, BOOL expanded) {
+    id s = FCB_groupScheme(obj);
+    return s ?: ((id (*)(id, SEL, id, BOOL))sGrpOrigB)(self, _cmd, obj, expanded);
+}
+static void FCB_installGroupColors(void) {
+    if (sGrpInstalled) return;
+    Class C = objc_getClass("FFColorForRole");
+    Method mA = C ? class_getClassMethod(C, NSSelectorFromString(@"colorSchemeForRolesOfObject:")) : NULL;
+    Method mB = C ? class_getClassMethod(C, NSSelectorFromString(@"colorSchemeForRolesOfObject:usingVideoRolesWhenExpanded:")) : NULL;
+    Method mI = C ? class_getClassMethod(C, NSSelectorFromString(@"colorSchemeForIndex:")) : NULL;
+    if (!mA || !mB || !mI) { FCB_LOG(@"group colors: FFColorForRole selectors missing; not installed"); return; }
+    sGrpRe = [NSRegularExpression regularExpressionWithPattern:@"fcpmcp:group=[^:\\s]+:(\\d+)" options:0 error:nil];
+    sGrpOrigIdx = method_getImplementation(mI);
+    sGrpOrigA = method_setImplementation(mA, (IMP)FCB_grpHookA);
+    sGrpOrigB = method_setImplementation(mB, (IMP)FCB_grpHookB);
+    sGrpInstalled = YES;
+    FCB_LOG(@"group colors installed");
+}
+static NSDictionary *FCB_groupsRefresh(NSDictionary *params) {
+    __block NSDictionary *out = nil;
+    FCB_runOnMain(^{
+        if (params[@"enabled"]) sGrpEnabled = [params[@"enabled"] boolValue];
+        id tm = FCB_activeTimeline();
+        SEL rs = NSSelectorFromString(@"reloadTimelineView:");
+        if (tm && [tm respondsToSelector:rs]) ((void (*)(id, SEL, id))objc_msgSend)(tm, rs, nil);   // void: never via an id-returning cast
+        out = @{@"installed": @(sGrpInstalled), @"enabled": @(sGrpEnabled), @"reloaded": @(tm != nil)};
+    });
+    return out;
+}
+
 // ---------------------------------------------------------------- dev.probe
 // SPIKE ONLY: dlopen a freshly-built dylib (unique path per build — dyld caches
 // by path) and run its `NSDictionary *FCBProbe(NSDictionary *)` on the main
@@ -1501,6 +1569,7 @@ static NSDictionary *FCB_devProbe(NSDictionary *params) {
 static NSDictionary *FCB_dispatch(NSString *method, NSDictionary *params) {
     if ([method isEqualToString:@"system.version"]) return FCB_systemVersion();
     if ([method isEqualToString:@"dev.probe"]) return FCB_devProbe(params);
+    if ([method isEqualToString:@"groups.refresh"]) return FCB_groupsRefresh(params);
     if ([method isEqualToString:@"timeline.clips"]) return FCB_timelineClips();
     if ([method isEqualToString:@"timeline.select"]) return FCB_timelineSelect(params);
     if ([method isEqualToString:@"timeline.debug_ranges"]) return FCB_debugRanges(params);
@@ -1609,6 +1678,8 @@ static void FCB_init(void) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                 dispatch_get_main_queue(), ^{
                     FCB_startServer();
+                    @try { FCB_installGroupColors(); }
+                    @catch (NSException *e) { FCB_LOG(@"group colors install failed: %@", e.reason); }
                     @try { FCB_installTranscriptMenu(); }
                     @catch (NSException *e) {
                         FCB_LOG(@"transcript menu install failed: %@", e.reason);
