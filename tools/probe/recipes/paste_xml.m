@@ -11,7 +11,7 @@ NSDictionary *FCBProbe(NSDictionary *a){
   BOOL valid=YES; if([tm respondsToSelector:@selector(validateUserInterfaceItem:)]){ NSMenuItem *mi=[[NSMenuItem alloc] initWithTitle:@"x" action:NSSelectorFromString(sel) keyEquivalent:@""]; valid=((BOOL(*)(id,SEL,id))objc_msgSend)(tm,@selector(validateUserInterfaceItem:),mi); }
   r[@"validated"]=@(valid);
   CFAbsoluteTime t0=CFAbsoluteTimeGetCurrent();
-  CALL1(tm,sel,nil);
+  CALLV1(tm,sel,nil);
   r[@"ms"]=@((CFAbsoluteTimeGetCurrent()-t0)*1000);
   r[@"undoBefore"]=before; r[@"undoAfter"]=D(CALL0(um,@"undoActionName"));
   r[@"found"]=D(findItemNamed(CALL0(activeSequence(),@"primaryObject"),@"PASTED_IMG_1255"));

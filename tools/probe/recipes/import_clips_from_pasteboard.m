@@ -5,7 +5,7 @@ NSDictionary *FCBProbe(NSDictionary *a){
   NSPasteboard *pb=[NSPasteboard pasteboardWithUniqueName]; [pb clearContents]; [pb setString:xml forType:@"com.apple.finalcutpro.xml.v1-13"];
   id task=CALL1(CLS("FFXMLTranslationTask"),@"translationTaskForPasteboard:",pb);
   id o=CALL0([objc_getClass("FFXMLImportOptions") alloc],@"initWithUserDefaults");
-  CALL1(o,@"setLibrary:",libNamed(a[@"lib"])); CALL1(o,@"setEvent:",eventNamed(a[@"lib"],a[@"event"]));
+  CALLV1(o,@"setLibrary:",libNamed(a[@"lib"])); CALLV1(o,@"setEvent:",eventNamed(a[@"lib"],a[@"event"]));
   ((void(*)(id,SEL,BOOL))objc_msgSend)(o,NSSelectorFromString(@"setSuppressWarnings:"),YES);
   CFAbsoluteTime t0=CFAbsoluteTimeGetCurrent();
   BOOL ok=((BOOL(*)(id,SEL,id))objc_msgSend)(task,NSSelectorFromString(@"importClipsWithOptions:"),o);

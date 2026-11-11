@@ -11,12 +11,12 @@ NSDictionary *FCBProbe(NSDictionary *a){
   [[NSRunLoop mainRunLoop] addTimer:wd forMode:NSModalPanelRunLoopMode];
   NSData *data=[NSData dataWithContentsOfFile:a[@"xml"]];
   id o=CALL0([objc_getClass("FFXMLImportOptions") alloc],@"initWithUserDefaults");
-  if(a[@"libraryURL"]){ CALL1(o,@"setLibraryURL:",[NSURL fileURLWithPath:a[@"libraryURL"]]);
+  if(a[@"libraryURL"]){ CALLV1(o,@"setLibraryURL:",[NSURL fileURLWithPath:a[@"libraryURL"]]);
     ((void(*)(id,SEL,BOOL))objc_msgSend)(o,NSSelectorFromString(@"setIsLibraryNew:"),[a[@"new"] boolValue]); }
   if(a[@"libraryName"]){ // existing open library by display name
-    for(id l in CALL0(CLS("FFLibraryDocument"),@"copyActiveLibraries")) if([D(CALL0(l,@"displayName")) isEqualToString:a[@"libraryName"]]) CALL1(o,@"setLibrary:",l); }
+    for(id l in CALL0(CLS("FFLibraryDocument"),@"copyActiveLibraries")) if([D(CALL0(l,@"displayName")) isEqualToString:a[@"libraryName"]]) CALLV1(o,@"setLibrary:",l); }
   ((void(*)(id,SEL,BOOL))objc_msgSend)(o,NSSelectorFromString(@"setSuppressWarnings:"),YES);
-  CALL1(o,@"setDocumentURL:",[NSURL fileURLWithPath:a[@"xml"]]);
+  CALLV1(o,@"setDocumentURL:",[NSURL fileURLWithPath:a[@"xml"]]);
   CFAbsoluteTime t0=CFAbsoluteTimeGetCurrent();
   NSArray *warn=nil; NSError *err=nil; id res=nil;
   @try{

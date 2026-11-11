@@ -69,6 +69,13 @@ Layers, bottom up:
   metadata keys through paste and through a user's edits? The fallback is a
   tag in the clip note. The spike used a name suffix, which worked but is
   visible.)
+- **Section colors through an injected group hook, not roles**:
+  `bridge/hooks/group_colors.m` replaces `+[FFColorForRole colorSchemeForRolesOfObject:]`
+  so a clip (and its connected audio, compounds included) tagged
+  `fcpmcp:group=<Name>:<palette>` in its note draws in that palette color. Untagged
+  clips keep role colors, so it degrades harmlessly if the hook isn't loaded.
+  Chapter markers mark the section starts. See `docs/groups-demo.png`. (Spike: loaded through
+  `dev.probe`; production: install from the bridge at launch.)
 - **Lane semantics through roles**: FCP lanes are just integers, but video
   roles/subroles (`B-roll.lane-1`, `Backdrop`, `Host`) are first-class: they
   are shown in the timeline index, can be soloed, and survive magnetic
@@ -172,6 +179,10 @@ These are kept from the earlier case studies and the spike.
 - **Don't bake dense keyframes into FCP**: 32k baked keys made the project's
   `export_xml` take 20.7 s (against ~100 ms otherwise), and import 18–27 s.
   Write authored keys and set exact tangents live instead.
+- **Chapter markers without `posterOffset` crash FCP** when drawn or clicked
+  (invalid time → NaN layer position → uncaught exception). The validator rejects them.
+- **Probe code: never send a void-returning selector through an id-returning
+  call.** ARC retains the garbage "result" and FCP segfaults. Use `CALLV*`.
 - **Paste side effect**: a paste also adds a browser clip to the target event.
   Clean it up, or paste through a hidden scratch event.
 

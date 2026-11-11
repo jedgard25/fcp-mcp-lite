@@ -12,13 +12,16 @@ the result through FCP's own renderer. Repo: `~/Projects/fcp-mcp-lite` (below,
 `$R`). Every path below is relative to `$R` unless absolute.
 
 Ground rules:
-- **Never write into, open, or read the user's other libraries or projects.**
-  Each job gets a **brand-new library** (`make_library.m`), e.g.
-  `~/Movies/<Job Name>.fcpbundle`. Unless the user names a library, build
-  there. Never open other libraries to look for material: the user may keep
-  reference edits there that you must not see. To change a result, import a
-  new version (`… v2`) into the same library; never overwrite. Leave the
-  library open when you're done so the user can review it.
+- **Never write into the user's existing libraries or projects** unless they ask.
+  By default each job gets a **brand-new library** (`make_library.m`), e.g.
+  `~/Movies/<Job Name>.fcpbundle`. To change a result, import a new version
+  (`… v2`) into the same library; never overwrite. Leave the library open when
+  you're done so the user can review it.
+- **Reference material**: reading the user's earlier edits (open libraries,
+  exported FCPXML) is fine and often useful for a similar video, e.g. matching
+  pacing, lane conventions or take choices. Don't if the user says the run is
+  **blind** (a test or benchmark); then don't open or read anything beyond the
+  media they pointed you at.
 - **Verify by re-reading and looking**, never by trusting a return value.
 - **Don't guess at FCP internals.** If something below doesn't cover it, stop
   and report rather than improvising private calls.
@@ -52,7 +55,7 @@ for long calls (default 120).
 | Recipe | Args | Does |
 |---|---|---|
 | `make_library.m` | `{"path": "/abs/New.fcpbundle"}` | Creates and opens a new, empty library. Refuses if the path exists. |
-| `open_library.m` | `{"path": "/abs/Lib.fcpbundle"}` | Reopens **your own** job library if it got closed. Never open anything else. |
+| `open_library.m` | `{"path": "/abs/Lib.fcpbundle"}` | Opens an existing library (same as File › Open Library), e.g. a reference edit the user points you to. |
 | `close_library.m` | `{"name": "Display Name"}` | Closes a library the FCP way (FCP saves it). Only for your own job library, and only if asked. |
 | `import_xml.m` | `{"xml": "/abs/file.fcpxml", "libraryName": "<your job library>", "watchdog": 15}` | Imports an FCPXML file (its `<event>` and `<project>`) into that library. No dialogs. Empty `warnings` = clean. `Invalid argument` almost always means the library isn't open. |
 | `open_project.m` | `{"lib": "<your job library>", "event": "<event>", "name": "<project>"}` | Opens that project in the timeline (needed before frames/screenshots). |
@@ -69,14 +72,19 @@ Bridge verbs (raw JSON-RPC on `127.0.0.1:9876`, one line per request):
 | Tool | Use |
 |---|---|
 | `python3 tools/align_audio.py CAM.MOV [CAM2 …] --audio A.wav [B.wav …]` | Pairs camera files with external/processed audio and finds the offset. Output `best[]`: `{camera, audio, offset_s, score}`, with **`audio_time = camera_time + offset_s`**. A score ≳ 0.5 means a confident match; ≈ 0.25 means not the same recording. ~3 s for 30 min of media. |
-| `tools/parakeet-transcriber/.build/release/parakeet-transcriber FILE --model v3 > words.json` | On-device ASR. Outputs a JSON list `[{word, startTime, endTime, confidence}]` in seconds of FILE. ~1.5 min per 15 min of audio. **Transcribe the processed WAV** (cleaner), then map to camera time with the offset. Run long files in the background. |
-| `python3 tools/cut_sheet.py export.fcpxml sheet.jpg [--from N] [--count N] [--handle 0.5]` | Per cut: head and tail frames from the source, plus the waveform of the connected audio across the cut ±handle, with red lines at the edit points. A red line inside a waveform blob = a cut mid-word. Works on any project whose spine clips carry a lane −1 audio child. |
+| `python3 tools/transcribe.py WAV -o words.json` | On-device ASR (Parakeet): splits at silences and runs **3 passes with different chunk seams**, then takes the union, so false starts aren't dropped (a single pass drops them). Output is `[{word, startTime, endTime, confidence}]` in WAV seconds. ~11 s for 17 min of audio. Cached. **Transcribe the processed WAV**, not camera audio. Never call the raw `parakeet-transcriber` on a whole long file. |
+| `python3 tools/takes.py --source /abs/CAM.MOV=words.json:OFFSET [--source …] --script script.md -o takes.json --text` | The **take sheet**: sentences in camera time, matched to script lines, retakes grouped, each marked `take` / `fragment` (false start) / `offscript`, with flags `filler` / `repeat` / `no_end`, plus a suggested pick per line (`»`). Lists `UNMATCHED SCRIPT LINES` (content nobody delivered or the matcher missed) and off-script chatter. Read the `--text` view instead of raw transcript. |
+| `python3 tools/build_roughcut.py --takes takes.json --source /abs/CAM.MOV=/abs/WAV:OFFSET [--source …] --project P --event E -o cut.fcpxml [--drop S012,S044] [--add S013]` | Writes the rough-cut FCPXML (timecode, sample-accurate WAV sync, muted camera audio, padding into silence without clipping neighbours, contiguous picks merged, clip IDs and section groups in notes, chapter markers per section) and **validates it**. Change picks with `--drop`/`--add` sentence ids. **Don't hand-write FCPXML for a rough cut.** |
+| `python3 tools/cut_sheet.py export.fcpxml sheet.jpg [--only 3,11,44] [--from N --count N] [--width 900]` | Per cut: head and tail frames, plus the waveform of the connected audio ±handle, with red lines at the edit points. A red line inside a waveform blob = a cut mid-word. Use `--only` with the cut indices story_check flagged; full pages are expensive to look at. |
 | `python3 tools/story_check.py export.fcpxml --words AUDIO.wav=words.json [--words …] [--text]` | Reads the cut back as **text in timeline order** (from each clip's connected-audio range, so no offsets needed) and flags **DUPLICATE** sentences (a retake left in, or a cut that ends on the line the next cut starts) and **STUTTER** (the same word on both sides of a cut, usually the first word of a retake left on a tail). Exit code 1 = something flagged. `--text` prints the whole kept transcript with cut markers. |
 | `ffprobe` / `ffmpeg` | Durations, timecode (`-show_entries stream_tags=timecode`), spot frames. |
-| `scripts/weftcut_to_fcpxml.py` | Reference converter. Import `tc_start_frames` from it instead of rewriting timecode math. |
+| `python3 tools/reconcile.py before.fcpxml after.fcpxml` | After the user edits by hand: diffs two exports by clip ID (from notes) and lists SPLIT / DELETED / TRIMMED / MOVED / RELANED / DISABLED, plus ADDED (no ID = the user's own clip). Run it before touching a project the user has edited, and treat their changes as decisions. |
+| `scripts/weftcut_to_fcpxml.py` | Reference converter (WeftCut project.json → FCPXML), and `tc_start_frames` for timecode. |
 
 ## 2. Writing FCPXML that FCP accepts
 
+For rough cuts use `build_roughcut.py`; it applies every rule below. Read this
+section when you need FCPXML it doesn't cover (B-roll, titles, markers).
 Template for an A-roll rough cut: camera video on the primary storyline, its
 scratch audio muted, the synced processed WAV connected underneath:
 
@@ -118,59 +126,52 @@ Rules. Each one was learned by FCP silently doing the wrong thing:
 - Child element order matters (DTD): adjustments, then connected clips, then
   `audio-channel-source`. Validate before importing:
   `tools/validate_fcpxml.sh file.fcpxml` (FCP's own DTD; plain `xmllint --dtdvalid` can't take its path with spaces).
+- **Chapter markers need `posterOffset="11/30s"`.** Without it FCP stores an
+  invalid time and **crashes** when the marker is drawn or clicked. The
+  validator rejects this.
+- **IDs and groups go in the clip `<note>`** (`fcpmcp:id=C001 fcpmcp:group=Intro:9`).
+  Custom `<metadata>` keys are dropped. Section colors come from the group
+  hook (`bridge/hooks/group_colors.m`), not roles: don't invent roles for sections.
 - After importing, **export it back and check** clip count, total duration and
   a few offsets. Compare times as fractions, never as text (FCP renormalizes).
 
 ## 3. Rough-cut method (talking head, multiple takes)
 
-1. **Inventory**: list the media; get durations and timecode; read any script.
-2. **Sync**: run `align_audio.py` over every camera file × every WAV. Pair
-   each camera file with its best match only if the score is clearly above the
-   others. Note the offsets.
-3. **Transcribe** each matched WAV. Convert word times to camera time:
-   `cam_t = wav_t − offset_s`. Drop words that fall outside the camera file.
-4. **Segment** into utterances: break on gaps > ~0.6 s or sentence punctuation.
-5. **Pick takes.** This is the editorial core:
-   - Line the utterances up against the script (fuzzy text match). Each script
-     beat should appear **once** in the cut, in script order.
-   - Retakes show up as near-duplicate utterances close together. **Default to
-     the last complete, fluent take**, since presenters restart until it's right.
-     Prefer a take with no stumble, filler or restart inside it.
-   - **False starts**: an utterance that trails off or is cut short, then
-     restarts the same words. Drop the fragment.
-   - Drop off-script chatter ("okay", "let me do that again", counting in,
-     slate claps) unless it's clearly intended content.
-   - If the script and the delivery disagree, the delivery wins; a presenter
-     ad-libbing a better line is content.
-6. **Cut points**: start ~0.10–0.15 s before the first word and end ~0.15–0.25 s
-   after the last word, inside the silence. Never cut inside a word. Merge
-   consecutive kept utterances from the same take (no cut between them).
-7. **Build** the FCPXML (section 2), validate, import into a new event, open the
-   project.
-8. **Audit** (below): story check first, then vision. Fix, re-import as `v2`,
-   and audit again until `story_check.py` is clean.
+1. **Inventory**: list the media and durations; find and read any script.
+2. **Sync**: `align_audio.py` over every camera file × every WAV. Pair each
+   camera file with its best match only if the score is clearly above the
+   others (≈0.9 vs ≈0.25 in practice). Note the offsets.
+3. **Transcribe** each matched WAV with `transcribe.py` (run both in parallel).
+4. **Take sheet**: `takes.py … --text`. The suggestion is the last clean,
+   complete take per script line in script order. **Review, don't rubber-stamp**:
+   - rows where the pick has `repeat`/`filler`/`no_end`, or where an earlier take
+     is complete and clean (the presenter may have restarted for delivery, not words)
+   - lines with `cov` < ~0.8 (part of the line may be in a neighbouring take)
+   - `UNMATCHED SCRIPT LINES`: missing content, or an ad-lib that replaced it
+   - off-script sentences that are actually content (ad-libs worth keeping)
+   If the script and the delivery disagree, the delivery wins.
+5. **Build** with `build_roughcut.py`, adjusting with `--drop`/`--add`. It
+   validates; import into a new event; open the project.
+6. **Audit** (section 4), fix with `--drop`/`--add`, rebuild as `v2`, repeat
+   until `story_check.py` is clean.
 
-## 4. Self-audit with vision. Do it every time, and look at the images
+## 4. Self-audit. Story first, then eyes; look at every image you make
 
-- **Timeline screenshot** (`snapshot_ui.m`): is the project open, is every cut
-  on the storyline, is the WAV lane present under each cut, does anything look
-  disabled (dimmed) or missing?
-- **Composite frames** (`composite_frames.m`) at ~6 times spread across the
-  cut, plus a few right after edit points: right person, right framing, no
-  black or offline frames ("Missing File" = a bad path).
-- **Cut sheet** (`cut_sheet.py` on the exported XML, in pages of ~10–12 cuts):
-  red edit lines should sit in silence; the head/tail frames show jump cuts.
-  Check every page for a cut of < 2 minutes, and the first few pages plus any
-  suspicious cuts for longer ones.
-- **Sync check**: for 2–3 cuts, compare the transcript word under an edit with
-  the waveform. If speech blobs consistently start before or after the
-  edit, the offset sign is wrong (`audio = camera + offset`).
-- **Story check (mandatory, automated + read)**: run `tools/story_check.py` on
-  the **exported** project. Fix every DUPLICATE and STUTTER, or justify keeping
-  it in your report. Then read its `--text` output top to bottom against the
-  script for missing beats. Frames and waveforms can't show a repeated sentence;
-  in the first blind run, a duplicated intro line and two stray retake words at
-  cut tails passed the visual audit and were caught only by this.
+1. **Story check (mandatory)**: `story_check.py` on the **exported** project.
+   Fix every DUPLICATE and STUTTER, or justify it. Then skim `--text` against the
+   script for missing beats. Frames and waveforms can't show a repeated
+   sentence; in the first blind run, a duplicated intro line and two stray
+   retake words passed the visual audit and only this caught them.
+2. **Cut sheets only where needed**: `cut_sheet.py --only <flagged cut indices>`
+   plus any cut you changed. Red edit lines must sit in silence. Don't page
+   through every cut; it's the most expensive thing you can look at.
+3. **Timeline screenshot** (`snapshot_ui.m`): project open, every cut on the
+   storyline, WAV lane under each cut, nothing dimmed or missing.
+4. **Composite frames** (`composite_frames.m`, width 640) at ~6 times: right
+   person, framing, no black or "Missing File" frames.
+5. **Sync spot-check** on 2 cuts: speech in the waveform lines up with the
+   transcript words at the edit. If it's consistently early or late, the offset
+   sign is wrong.
 
 ## 5. Report back
 
@@ -183,6 +184,8 @@ plainly what you did **not** verify.
 ## Known sharp edges
 - A modal dialog in FCP blocks every call. If a call hangs, run `visible_windows.m`
   and report; don't keep retrying.
-- Don't create libraries or call save methods. FCP saves on its own.
+- Don't call save methods on libraries. FCP saves on its own.
+- In probe code, never call a void-returning selector through `CALL0`/`CALL1`
+  (ARC retains garbage and FCP crashes). Use `CALLV0`/`CALLV1`.
 - Large baked keyframe sets make export/import slow (tens of seconds); a
   rough cut has none, and should export in well under a second.

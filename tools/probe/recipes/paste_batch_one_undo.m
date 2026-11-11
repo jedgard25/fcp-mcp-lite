@@ -8,7 +8,7 @@ NSDictionary *FCBProbe(NSDictionary *a){
   [um beginUndoGrouping]; [um setActionName:@"WeftCut: B-roll batch"];
   NSArray *times=a[@"times"]; CFAbsoluteTime t0=CFAbsoluteTimeGetCurrent();
   for(NSNumber *t in times){ [pb clearContents]; [pb setString:[xml stringByReplacingOccurrencesOfString:@"PASTED_B" withString:[NSString stringWithFormat:@"PASTED_B_%@",t]] forType:@"com.apple.finalcutpro.xml.v1-13"];
-    ((void(*)(id,SEL,CMTime))objc_msgSend)(cont,NSSelectorFromString(@"setPlayheadSequenceTime:"),CMT([t doubleValue])); CALL1(tm,@"pasteAnchored:",nil); }
+    ((void(*)(id,SEL,CMTime))objc_msgSend)(cont,NSSelectorFromString(@"setPlayheadSequenceTime:"),CMT([t doubleValue])); CALLV1(tm,@"pasteAnchored:",nil); }
   [um setActionName:@"WeftCut: B-roll batch"]; [um endUndoGrouping];
   r[@"ms"]=@((CFAbsoluteTimeGetCurrent()-t0)*1000); r[@"undoName"]=D(CALL0(um,@"undoActionName")); r[@"groupLevel"]=@([um groupingLevel]);
   // inspector display string for E_posEase x at key0: check unit formatting

@@ -57,3 +57,7 @@ static NSArray *dumpKeys(id ch){
 }
 static double valAt(id ch,double s){ return ((double(*)(id,SEL,CMTime))objc_msgSend)(ch,NSSelectorFromString(@"curveDoubleValueAtTime:"),CMT(s)); }
 static id xformOf(id it){ for(id e in CALL0(CALL0(it,@"videoEffects"),@"intrinsicEffects")) if([D(CALL0(e,@"effectID")) isEqualToString:@"HEXForm3D"]) return e; return nil; }
+// Void-returning calls. NEVER use CALL0/CALL1 for selectors returning void or a
+// non-object: ARC retains the "result" and crashes FCP (learned the hard way).
+static inline void CALLV0(id o, NSString *s){ SEL x=NSSelectorFromString(s); if(o&&[o respondsToSelector:x]) ((void(*)(id,SEL))objc_msgSend)(o,x); }
+static inline void CALLV1(id o, NSString *s, id a){ SEL x=NSSelectorFromString(s); if(o&&[o respondsToSelector:x]) ((void(*)(id,SEL,id))objc_msgSend)(o,x,a); }
