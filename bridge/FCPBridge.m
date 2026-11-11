@@ -1462,10 +1462,45 @@ static void FCB_installTranscriptMenu(void) {
     FCB_LOG(@"Transcript panel installed (Window > Transcript)");
 }
 
+
+// ---------------------------------------------------------------- dev.probe
+// SPIKE ONLY: dlopen a freshly-built dylib (unique path per build — dyld caches
+// by path) and run its `NSDictionary *FCBProbe(NSDictionary *)` on the main
+// thread, exceptions caught. Lets private-API experiments iterate without
+// relaunching FCP. Gated by FCB_DEV_PROBE=1 or ~/.fcpbridge-dev-probe.
+#import <dlfcn.h>
+static BOOL FCB_probeEnabled(void) {
+    if (getenv("FCB_DEV_PROBE")) return YES;
+    return [[NSFileManager defaultManager] fileExistsAtPath:
+        [NSHomeDirectory() stringByAppendingPathComponent:@".fcpbridge-dev-probe"]];
+}
+static NSDictionary *FCB_devProbe(NSDictionary *params) {
+    if (!FCB_probeEnabled()) return @{@"error": @"dev.probe disabled"};
+    NSString *path = params[@"path"];
+    if (![path isKindOfClass:[NSString class]]) return @{@"error": @"path required"};
+    __block NSDictionary *out = nil;
+    FCB_runOnMain(^{
+        void *h = dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
+        if (!h) { out = @{@"error": [NSString stringWithFormat:@"dlopen: %s", dlerror()]}; return; }
+        NSDictionary *(*fn)(NSDictionary *) = dlsym(h, "FCBProbe");
+        if (!fn) { out = @{@"error": @"no FCBProbe symbol"}; return; }
+        @try {
+            NSDictionary *args = params[@"args"];
+            out = fn([args isKindOfClass:[NSDictionary class]] ? args : @{});
+        } @catch (NSException *e) {
+            out = @{@"error": [NSString stringWithFormat:@"%@: %@", e.name, e.reason]};
+        }
+        if (![NSJSONSerialization isValidJSONObject:out ?: @{}])
+            out = @{@"error": @"probe returned non-JSON", @"desc": [out description] ?: @""};
+    });
+    return out ?: @{};
+}
+
 // ---------------------------------------------------------------- server
 
 static NSDictionary *FCB_dispatch(NSString *method, NSDictionary *params) {
     if ([method isEqualToString:@"system.version"]) return FCB_systemVersion();
+    if ([method isEqualToString:@"dev.probe"]) return FCB_devProbe(params);
     if ([method isEqualToString:@"timeline.clips"]) return FCB_timelineClips();
     if ([method isEqualToString:@"timeline.select"]) return FCB_timelineSelect(params);
     if ([method isEqualToString:@"timeline.debug_ranges"]) return FCB_debugRanges(params);

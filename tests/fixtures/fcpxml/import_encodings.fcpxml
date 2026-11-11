@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<!-- Fixture: point media-rep src at any local 4K 29.97 .mov with stereo audio before importing. -->
+<fcpxml version="1.13">
+<resources>
+<format id="r1" name="FFVideoFormat3840x2160p2997" frameDuration="1001/30000s" width="3840" height="2160" colorSpace="1-1-1 (Rec. 709)"/>
+<asset id="r2" name="IMG_1254" start="0s" duration="88851/600s" hasVideo="1" hasAudio="1" videoSources="1" audioSources="1" audioChannels="2" audioRate="48000"><media-rep kind="original-media" src="file:///path/to/media/IMG_1254.mov"/></asset>
+</resources>
+<event name="Fixtures"><project name="fx-encodings"><sequence format="r1" duration="300300/30000s" tcStart="0s" tcFormat="NDF" audioLayout="stereo" audioRate="48k"><spine>
+<gap offset="0s" start="0s" duration="300300/30000s">
+ <asset-clip ref="r2" lane="1" offset="0s" start="0s" duration="30030/30000s" name="A_srcEnableVideo" srcEnable="video"/>
+ <video ref="r2" lane="2" offset="0s" start="0s" duration="30030/30000s" name="B_videoElement"/>
+ <asset-clip ref="r2" lane="3" offset="0s" start="0s" duration="30030/30000s" name="C_channelSourceOff"><audio-channel-source srcCh="1, 2" enabled="0"/></asset-clip>
+ <asset-clip ref="r2" lane="4" offset="0s" start="0s" duration="30030/30000s" name="D_audioRoleNone" audioRole="dialogue"><adjust-volume amount="-96dB"/></asset-clip>
+ <video ref="r2" lane="5" offset="60060/30000s" start="0s" duration="60060/30000s" name="E_posEase"><adjust-transform><param name="position"><keyframeAnimation><keyframe time="0s" value="0 0" interp="ease" curve="smooth"/><keyframe time="30030/30000s" value="50 0" interp="ease" curve="smooth"/></keyframeAnimation></param></adjust-transform></video>
+ <video ref="r2" lane="6" offset="60060/30000s" start="0s" duration="60060/30000s" name="F_posEaseIn"><adjust-transform><param name="position"><keyframeAnimation><keyframe time="0s" value="0 0" interp="easeIn"/><keyframe time="30030/30000s" value="50 0" interp="easeOut"/></keyframeAnimation></param></adjust-transform></video>
+ <video ref="r2" lane="7" offset="60060/30000s" start="0s" duration="60060/30000s" name="G_scaleEase"><adjust-transform><param name="scale"><keyframeAnimation><keyframe time="0s" value="1 1" interp="ease"/><keyframe time="30030/30000s" value="2 2" interp="ease"/></keyframeAnimation></param></adjust-transform></video>
+ <video ref="r2" lane="8" offset="150150/30000s" start="300300/30000s" duration="60060/30000s" name="H_retime"><timeMap><timept time="0s" value="0s" interp="linear"/><timept time="600600/30000s" value="300300/30000s" interp="linear"/></timeMap></video>
+</gap>
+</spine></sequence></project></event></fcpxml>

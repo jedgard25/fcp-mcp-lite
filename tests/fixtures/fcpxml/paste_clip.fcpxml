@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<!-- Fixture: point media-rep src at any local 4K 29.97 .mov with stereo audio before importing. -->
+<fcpxml version="1.13">
+<resources>
+<format id="r1" name="FFVideoFormat3840x2160p2997" frameDuration="1001/30000s" width="3840" height="2160"/>
+<asset id="r2" name="IMG_1255" start="0s" hasVideo="1" hasAudio="1" videoSources="1" audioSources="1" audioChannels="2" audioRate="48000"><media-rep kind="original-media" src="file:///path/to/media/IMG_1255.mov"/></asset>
+</resources>
+
+ <asset-clip ref="r2" name="PASTED_IMG_1255" offset="0s" start="0s" duration="60060/30000s" format="r1">
+  <adjust-crop mode="trim"><trim-rect left="56.8889" right="32"/></adjust-crop>
+  <adjust-conform type="none"/>
+  <adjust-transform scale="2 2"><param name="position"><keyframeAnimation><keyframe time="0s" value="120.889 0"/><keyframe time="18018/30000s" value="32 0"/></keyframeAnimation></param></adjust-transform>
+  <audio-channel-source srcCh="1, 2" enabled="0"/>
+ </asset-clip>
+
+</fcpxml>

@@ -6,3 +6,4 @@ __pycache__/
 *.pyc
 .DS_Store
 # local runtime state (logs, transcript caches) lives outside the repo
+tools/probe/build/

@@ -1,8 +1,10 @@
 # Bridge contract (implemented in `bridge/FCPBridge.m`)
 
 The dylib exposes JSON-RPC 2.0 over TCP `127.0.0.1:9876`, one JSON object per
-line. Seven verbs — responder-chain / `FFEditActionMgr` paths only, no runtime
-introspection surface. All timeline reads/writes run on the main thread.
+line. All timeline reads/writes run on the main thread. This is the **current**
+surface; the target verb set (`export_xml`, `paste_xml`, `batch_begin/end`,
+`set_param`, `edit`, `frames`, `screenshot`, `open_project`) is listed in
+[`direction.md`](direction.md) and gets added here as it lands.
 
 | Method | Params | Returns |
 |---|---|---|
@@ -14,6 +16,7 @@ introspection surface. All timeline reads/writes run on the main thread.
 | `timeline.release_handles` | — | `{ released: true }` — drops the ID store |
 | `timeline.action` | `{action}` | allowlist: `blade bladeAll delete cut copy paste selectClipAtPlayhead selectAll deselectAll addMarker addChapterMarker nextEdit previousEdit trimToPlayhead openCompound timelineBack` → `action:` selector on the timeline module, sender=nil. Step-in recipe: `timeline.select {id of container}` then `openCompound`; step-out: `timelineBack` |
 | `playback.position` | — | `{ t_s, fps, duration_s }` |
+| `dev.probe` | `{path, args}` | Development only; enabled when `FCB_DEV_PROBE` is set or `~/.fcpbridge-dev-probe` exists. `dlopen`s a probe dylib (use a unique path per build, because dyld caches by path) and runs its `NSDictionary *FCBProbe(NSDictionary *)` on the main thread with exceptions caught. Harness: `tools/probe/run.py tools/probe/recipes/<recipe>.m '{json}'`; the recipes are the working reference for each discovered call |
 | `playback.seek` | `{t_s}` | `{ t_s, status }` via `setPlayheadTime:` (600 kHz CMTime) |
 
 Cut planning, silence detection, transcription and verification live in

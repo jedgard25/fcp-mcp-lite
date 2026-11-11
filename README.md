@@ -2,9 +2,16 @@
 
 ![The Transcript panel editing a sequence inside Final Cut Pro](preview-image.jpg)
 
-Lightweight MCP server for Final Cut Pro: **transcribe, cut, audit**. It drives a
-patched FCP over a local JSON-RPC bridge — no Workflow Extension SDK, no
-`.appex`, no private framework linking beyond the dylib the patcher injects.
+Agent-native MCP for Final Cut Pro. It drives a patched FCP over a local
+JSON-RPC bridge, with no Workflow Extension SDK, no `.appex`, and no private
+framework linking beyond the dylib the patcher injects.
+
+**Where this is going:** [`docs/direction.md`](docs/direction.md). The goal is a
+blind Claude session building a full multi-lane edit (transcript rough cut,
+animated B-roll, VO, fades) in FCP in 20–30 minutes, editing the open project
+in place and looking at its own work. The evidence that FCP can hold such an
+edit 1:1 is in [`docs/weftcut-parity-audit.md`](docs/weftcut-parity-audit.md).
+The verbs below are today's shipped surface (transcribe, cut, audit).
 
 It is a small rewrite built on [SpliceKit](https://github.com/elliotttate/SpliceKit)
 (MIT) — its copy-→-inject-→-re-sign approach and bridge patterns were the
@@ -31,9 +38,10 @@ file+model; a read never spawns an engine.
 1. **Identity, not time.** Clips carry session-stable ids and word ops carry
    file-relative word indices. Timestamps are resolved against the live timeline
    at commit, never stored in a plan, so chained cuts never go stale.
-2. **Validate whole, then cut serially.** Destructive ops compute the full cut
-   list first, split it at primary-clip edges, and verify each ripple. FCP gives
-   no atomic batch transaction.
+2. **Validate whole, then write as one batch.** Destructive ops compute the full
+   cut list first and verify after writing. Today's cut verbs still issue N
+   undo entries; `FFUndoManager` grouping (proven, see the audit) makes a batch
+   one undo step, and new verbs use it.
 3. **Revert, never wrong-cut.** A select miss auto-reverts issued blades; a stale
    id refuses; a stale transcript refuses. Blocking beats guessing.
 4. **`dry_run` everywhere** (on by default). Rehearse the exact op, write nothing.
@@ -102,38 +110,22 @@ validation and log as the agent verbs.
 
 ## Size & contributing
 
-About **7,800 lines** of tracked source — and roughly 1,000 of those are the
-vendored `silence-detector.swift` and Parakeet transcriber, not this project's
-code. The core (`patch/` + `bridge/` + `mcp/`) is ~4,500 lines; `extensions/`
-and `tests/` make up the rest. It's small enough to read top to bottom, and it
-is meant to stay that way.
+The core (`patch/` + `bridge/` + `mcp/`) is ~4,500 lines; about 1,000 more are
+the vendored `silence-detector.swift` and Parakeet transcriber. It is growing
+into a full editing MCP along the workstreams in
+[`docs/direction.md`](docs/direction.md). Keep the bridge a set of dumb, typed,
+main-thread verbs, and keep the planning in Python.
 
-This is deliberately a minimal MCP. The goal isn't a pile of niche features —
-it's to find the best *shape* for agent editing workflows: the right harness of
-operations that compose, from editing through testing and auditing, rather than
-one-offs. To help find that shape, fork it or open a PR — keep the core lean and
-dependency-free, and put optional surface under `extensions/`.
+## Current limitations (each is a direction.md workstream)
 
-## Limitations
-
-- **No multi-track or higher-level shape.** The model works clip-by-clip on the
-  primary storyline: there's no representation of nested sequences, connected
-  audio/B-roll, or the edit as a single object to reason over. Finding the right
-  shape for that is the hard, open problem — these verbs are a bet, not a
-  settled answer.
-- A batch is **N undo entries**, not one (`undo_steps` counts issued actions;
-  inspect before a bulk undo).
+- Today's shipped verbs work clip-by-clip on the primary storyline. The
+  multi-lane edit model (slices, lanes, stable IDs) is W2. The FCPXML
+  converter (`scripts/weftcut_to_fcpxml.py`) already holds the mapping.
+- Today's cut verbs issue **N undo entries** per batch (`undo_steps` counts
+  them). Grouped undo is proven, but these verbs don't use it yet.
 - Cuts are capped at 40 primary-clip pieces per call by default and return
   `pending` for continuation.
-- Silence scans cover every on-disk primary clip (one detector run per file);
-  word/silence ops are file-anchored and re-resolve against the live timeline.
-- Single-user assumed; cut targeting is primary-storyline-first, so connected
-  timelines often miss (guarded — never wrong).
-
-## Next steps
-
-- **Give the model eyes.** Today it reasons over times and word indices and
-  never sees a frame. A likely direction is a Remotion-style *film sheet*: for
-  each cut, a video thumbnail beside a waveform strip, rendered into one image
-  the model can actually look at. That closes the gap between editing by number
-  and editing by what the cut looks like.
+- Vision (composite frames, cut sheets, timeline screenshots) is proven (`tools/probe/recipes/composite_frames.m`,
+  `snapshot_ui.m`, `tools/cut_sheet.py`) and not yet exposed as verbs (W3).
+- `dev.probe` (hot-loaded discovery dylibs) is gated by `~/.fcpbridge-dev-probe`
+  and is for development only.
